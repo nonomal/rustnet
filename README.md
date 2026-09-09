@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ja.md">日本語</a>
 </p>
 
 <p align="center">
@@ -28,13 +28,16 @@
 
 ## Features
 
-- **Per-process attribution**: Every TCP, UDP, and QUIC connection mapped to its owning process, via eBPF on Linux, PKTAP on macOS, native APIs on Windows and FreeBSD. Wireshark and tcpdump can't do this; `netstat` / `ss` can't show live state.
-- **Deep packet inspection**: Identify HTTP, HTTPS/TLS with SNI, DNS, SSH, FTP, QUIC, MQTT, BitTorrent, STUN, NTP, mDNS, LLMNR, DHCP, SNMP, SSDP, and NetBIOS, without external dissectors.
+- **Per-process attribution**: Every TCP, UDP, and QUIC connection mapped to its owning process, via eBPF on Linux, PKTAP on macOS, ETW with an automatic IP Helper fallback on Windows, and native APIs on FreeBSD. Details include PID, executable, user/group names, match confidence, and a capped parent-process chain on every platform. Wireshark and tcpdump can't do this; `netstat` / `ss` can't show live state.
+- **Deep packet inspection**: Identify HTTP, HTTPS/TLS with SNI, DNS, SSH, FTP, QUIC, MQTT, BitTorrent, WireGuard, OpenVPN, STUN, NTP, mDNS, LLMNR, DHCP, SNMP, SSDP, and NetBIOS, without external dissectors.
+- **Annotated PCAPNG export**: `--pcapng-export` writes a Wireshark-ready capture with process, PID, direction, DPI/SNI, and GeoIP embedded as per-packet comments. Open it in Wireshark and every packet already names its owning process, with no post-processing. Classic `--pcap-export` with a JSONL sidecar for offline correlation is also available.
 - **Security sandboxing**: Landlock (Linux 5.13+), Seatbelt (macOS), token privilege drop + job-object child-process block (Windows). Drops privileges immediately after libpcap initializes. See [SECURITY.md](SECURITY.md).
-- **TCP network analytics**: Real-time retransmissions, out-of-order packets, and fast-retransmit detection, per-connection and aggregate.
-- **Smart connection lifecycle**: Protocol-aware timeouts with white → yellow → red staleness indicators. Toggle `t` to keep historic (closed) connections visible for forensics.
+- **Network analytics**: Real-time round-trip times for TCP, QUIC handshakes, DNS responses, and ICMP echo, plus TCP retransmission, out-of-order, and fast-retransmit detection. Protocol-aware health badges surface TCP issues, explicit QUIC Retry/version events, and retries/timeouts for transaction-based UDP, with severity-first sorting in the Overview table.
+- **Smart connection lifecycle**: Protocol-aware timeouts; idle rows get a yellow-to-red stripe and removal countdown and soften toward gray. Toggle `t` to keep historic (closed) connections visible for forensics.
 - **Vim/fzf-style filtering**: `port:`, `src:`, `dst:`, `sni:`, `process:`, `state:`, `proto:`, plus regex via `/(?i)pattern/`.
 - **GeoIP enrichment**: Country lookups via local MaxMind GeoLite2. No network calls.
+- **LAN device identification**: MAC address and vendor (from the embedded IEEE OUI database) for on-link peers and the gateway, learned passively from ARP traffic and shown in the details pane.
+- **Kubernetes attribution** (optional `kubernetes` feature): connections mapped to their pod, namespace, and container, shown in the details pane, JSON/PCAPNG exports, and the `pod:`, `ns:`, `container:` filters. Enabled in the official Docker image; on a cluster, use the [kubectl-rustnet](https://github.com/domcyrus/kubectl-rustnet) plugin to run it as an ephemeral debug pod. See [USAGE.md](USAGE.md#--kubernetes-mode-optional-feature).
 - **Cross-platform**: Linux, macOS, Windows, FreeBSD.
 
 ## Why RustNet?
@@ -45,29 +48,24 @@ RustNet fills the gap between simple connection tools (`netstat`, `ss`) and pack
 - **Connection-centric view**: Track states, bandwidth, and protocols per connection in real-time
 - **SSH-friendly**: TUI works over SSH so you can quickly see what's happening on a remote server without forwarding X11 or capturing traffic
 
-RustNet complements packet capture tools. Use RustNet to see *what's making connections*. For deep forensic analysis, use `--pcap-export` to capture packets with process attribution, then enrich with `scripts/pcap_enrich.py` and analyze in Wireshark with full PID/process context. See [PCAP Export](USAGE.md#pcap-export) and [Comparison with Similar Tools](ARCHITECTURE.md#comparison-with-similar-tools) for details.
+RustNet complements packet capture tools. Use RustNet to see *what's making connections*. For direct Wireshark inspection, `--pcapng-export` writes live best-effort packet comments with PID/process context. For cleanup-time correlation, use `--pcap-export` plus the JSONL sidecar and optional `scripts/pcap_enrich.py`. See [PCAP Export](USAGE.md#pcap-export) and [Comparison with Similar Tools](ARCHITECTURE.md#comparison-with-similar-tools) for details.
 
 Built on ratatui, libpcap, eBPF (libbpf-rs), DashMap, crossbeam, ring, MaxMind GeoLite2, and Landlock. See [ARCHITECTURE.md](ARCHITECTURE.md#dependencies) for the full dependency breakdown.
 
 <details>
 <summary><b>eBPF Enhanced Process Identification (Linux Default)</b></summary>
 
-RustNet uses kernel eBPF programs by default on Linux for enhanced performance and lower overhead process identification. However, this comes with important limitations:
+RustNet uses kernel eBPF programs by default on Linux for enhanced performance and lower overhead process identification.
 
-**Process Name Limitations:**
-- eBPF uses the kernel's `comm` field, which is limited to 16 characters
-- Shows the task/thread command name, not the full executable path
-- Multi-threaded applications often show thread names instead of the main process name
-
-**Real-world Examples:**
-- **Firefox**: May appear as "Socket Thread", "Web Content", "Isolated Web Co", or "MainThread"
-- **Chrome**: May appear as "ThreadPoolForeg", "Chrome_IOThread", "BrokerProcess", or "SandboxHelper"
-- **Electron apps**: Often show as "electron", "node", or internal thread names
-- **System processes**: Show truncated names like "systemd-resolve" → "systemd-resolve"
+**Process Names:**
+- eBPF records the process group leader's TGID and `comm` name (a kernel field limited to 16 characters) rather than the acting thread's name, so multi-threaded applications show the main process name instead of thread names like "Socket Thread"
+- RustNet then re-resolves the current name via `/proc/<tgid>/comm`, recovers comm-truncated names from the executable's file name (e.g. "chromium-browse" becomes "chromium-browser"), and resolves the full executable path shown in the Details view
+- Short-lived processes that exit before this enrichment runs keep the eBPF-recorded 16-character name
 
 **Fallback Behavior:**
+- On Linux 5.11 and newer, a one-shot BPF task-file iterator inventories sockets that were already open at startup, including sockets owned by root and other users when RustNet runs with file capabilities
 - When eBPF fails to load or lacks sufficient permissions, RustNet automatically falls back to standard procfs-based process identification
-- Standard mode provides full process names but with higher CPU overhead
+- Older kernels and procfs-only builds resolve names through procfs scanning, which has higher CPU overhead and can only inspect socket owners visible to the RustNet user
 - eBPF is enabled by default; no special build flags needed
 
 To disable eBPF and use procfs-only mode, build with:
@@ -80,12 +78,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for technical information.
 </details>
 
 <details>
-<summary><b>Interface Statistics Monitoring</b></summary>
+<summary><b>Process Activity and Host Monitoring</b></summary>
 
-RustNet provides real-time network interface statistics across all supported platforms:
+RustNet combines process-level traffic accounting with real-time network interface statistics:
 
 - **Overview Tab**: Shows active interfaces with current rates, errors, and drops
-- **Interfaces Tab** (press `3`): Detailed table with comprehensive metrics for all interfaces
+- **Activity Tab** (press `3`): Ranks processes by Egress (TX) or Ingress (RX), including retained and rolling traffic, rates, shares, connections, and destinations
+- **Security Workflow**: Sort by Egress, identify an unexpected uploader, then inspect its top remote peer and retained traffic even after the connection closes
+- **Host Tab** (press `5`): Shows TCP LISTEN sockets, UDP BOUND endpoints, aggregated TCP states, observed RTT, and process ownership
+- **Interface Details** (press `i` on Host): Shows comprehensive metrics for every interface
 - **Cross-Platform**: Linux (sysfs), macOS/FreeBSD (getifaddrs), Windows (GetIfTable2 API)
 - **Smart Filtering**: Windows automatically excludes virtual/filter adapters
 
@@ -110,7 +111,7 @@ Stats are collected every 2 seconds in a background thread with minimal performa
   </tr>
   <tr>
     <td align="center"><strong>Graph</strong><br>Traffic chart, app distribution, top processes<br><img src="./assets/screenshots/graph.png" width="400"></td>
-    <td align="center"><strong>Interfaces</strong><br>Per-interface RX/TX history with errors and drops<br><img src="./assets/screenshots/interfaces.png" width="400"></td>
+    <td align="center"><strong>Activity</strong><br>Process egress/ingress, 60-second coverage, attribution, and remote peers<br><img src="./assets/screenshots/interfaces.png" width="400"></td>
   </tr>
 </table>
 
@@ -123,9 +124,10 @@ Stats are collected every 2 seconds in a background thread with minimal performa
 brew install rustnet
 ```
 
-**Ubuntu (25.10+):**
+**Ubuntu (22.04 LTS+) / Linux Mint 21+ / Pop!_OS 22.04+:**
 ```bash
 sudo add-apt-repository ppa:domcyrus/rustnet
+# on Pop!_OS: sudo apt-manage add ppa:domcyrus/rustnet
 sudo apt update && sudo apt install rustnet
 ```
 
@@ -161,7 +163,7 @@ cargo install rustnet-monitor
 **Windows (Chocolatey):**
 ```powershell
 # Run in Administrator PowerShell
-# Requires Npcap (https://npcap.com) installed with "WinPcap API-compatible Mode" enabled
+# Requires Npcap (https://npcap.com); default installer settings are supported
 choco install rustnet
 ```
 
@@ -188,7 +190,11 @@ rustnet -i eth0              # Specify network interface
 rustnet --show-localhost     # Show localhost connections
 rustnet --no-resolve-dns     # Disable reverse DNS lookups (enabled by default)
 rustnet -r 500               # Set refresh interval (ms)
+rustnet --theme tokyo-night  # Theme: muted (default), vivid, catppuccin-mocha, tokyo-night, gruvbox, nord
+rustnet --pcapng-export capture.pcapng  # Annotated PCAPNG for Wireshark
 ```
+
+The theme and per-color overrides can also be set in `~/.config/rustnet/config.toml`; `--theme` takes precedence. See [USAGE.md](USAGE.md#--theme-preset) for the schema.
 
 See [INSTALL.md](INSTALL.md) for detailed permission setup and [USAGE.md](USAGE.md) for complete options.
 
@@ -205,23 +211,28 @@ See [INSTALL.md](INSTALL.md) for detailed permission setup and [USAGE.md](USAGE.
 | `x` | Clear all connections (press twice to confirm) |
 | `Tab` or `]` | Next tab |
 | `Shift+Tab` or `[` | Previous tab |
-| `1`–`5` | Jump to Overview / Details / Interfaces / Graph / Help |
+| `1`–`5` | Jump to Overview / Details / Activity / Graph / Host |
 | `↑/k` `↓/j` | Navigate up/down |
 | `g` `G` | Jump to first/last connection |
 | `Enter` | View connection details |
 | `Esc` | Go back or clear filter |
 | `c` | Copy remote address |
 | `p` | Toggle service names/ports |
-| `d` | Toggle hostnames/IPs |
+| `d` | Toggle hostnames/IPs on Overview or Egress/Ingress on Activity |
 | `s` `S` | Cycle sort columns / toggle direction |
 | `a` | Toggle process grouping |
 | `Space` | Expand/collapse process group |
-| `←/→` or `h/l` | Collapse/expand group |
+| `←` / `→` or `l` | Collapse/expand group |
 | `PageUp/PageDown` or `Ctrl+B/F` | Page navigation |
 | `t` | Toggle historic (closed) connections |
+| `i` | Toggle System info on Overview or interface details on Host |
 | `r` | Reset view (grouping, sort, filter) |
 | `/` | Enter filter mode |
-| `h` | Toggle help |
+| `h` | Toggle contextual help for the active tab |
+
+On Overview, the bottom status bar highlights process grouping and historic
+connections while those modes are active. In grouped mode it also shows
+`space expand` or `space collapse` for the selected process group.
 
 See [USAGE.md](USAGE.md) for detailed keyboard controls and navigation tips.
 
@@ -237,9 +248,9 @@ See [USAGE.md](USAGE.md) for detailed keyboard controls and navigation tips.
 ```
 
 **Sorting:**
-- Press `s` to cycle through sortable columns (Protocol, Address, State, Service, Bandwidth, Process)
+- Press `s` to cycle through sortable columns (Process, Addresses, Service, Application, State, Bandwidth)
 - Press `S` (Shift+s) to toggle sort direction
-- Find bandwidth hogs: Press `s` until "Down/Up ↓" appears (sorts by combined up+down speed)
+- Find bandwidth hogs: Press `s` until "Bandwidth Total ↓" appears (sorts by combined up+down speed)
 
 See [USAGE.md](USAGE.md) for complete filtering syntax and sorting guide.
 
@@ -278,19 +289,19 @@ See [USAGE.md](USAGE.md) for complete filtering syntax and sorting guide.
 RustNet uses smart timeouts and visual warnings before removing connections:
 
 **Visual staleness indicators:**
-- **White**: Active (< 75% of timeout)
-- **Yellow**: Stale (75-90% of timeout)
-- **Red**: Critical (> 90% of timeout)
+- **Full color**: Active (< 50% of timeout)
+- **Countdown**: Idle (50-100% of timeout); a `▎` stripe at the left edge and the time left in the bandwidth column run yellow through orange to red as removal nears, while the identifying columns soften toward gray
+- **Gray**: Historic, closed and archived, shown as a faint row with `closed` in the State column (toggle `t` to show)
 
 **Protocol-aware timeouts:**
 - **HTTP/HTTPS**: 10 minutes (supports keep-alive)
 - **SSH**: 30 minutes (long sessions)
-- **TCP active**: 10 minutes, idle: 5 minutes
+- **Generic TCP established**: 5 minutes
 - **QUIC connected**: 3 minutes (or peer's transport-param idle timeout, when present); `Initial`/`Handshaking`: 60 seconds
 - **DNS**: 30 seconds
-- **TCP CLOSED**: 5 seconds
+- **TCP CLOSED**: 15-second archival grace
 
-Example: An HTTP connection turns yellow at 7.5 min, red at 9 min, and is removed at 10 min.
+Example: An HTTP connection shows its countdown from 5 min, is removed at 10 min, and then appears as a gray historic row when history is on.
 
 See [USAGE.md](USAGE.md) for complete timeout details.
 
@@ -302,6 +313,7 @@ See [USAGE.md](USAGE.md) for complete timeout details.
 - **[USAGE.md](USAGE.md)** - Complete usage guide including command-line options, filtering, sorting, and logging
 - **[SECURITY.md](SECURITY.md)** - Security features including Landlock sandboxing and privilege management
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - Technical architecture, platform implementations, and performance details
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution workflow, quality requirements, and project guidelines
 - **[PROFILING.md](PROFILING.md)** - Performance profiling guide with flamegraph setup and optimization tips
 - **[ROADMAP.md](ROADMAP.md)** - Planned features and future improvements
 - **[RELEASE.md](RELEASE.md)** - Release process for maintainers

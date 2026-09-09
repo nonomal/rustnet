@@ -1,247 +1,677 @@
-//! Static help/legend tab — a paragraph of keybinds, mouse
-//! controls, colors, and filter examples. No state, no inputs.
+//! Contextual help overlay for the active tab.
 
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Clear, Padding, Paragraph, Wrap},
 };
 
-use crate::ui::{ClickableRegions, Component, ComponentContext, panel_block, theme};
+use crate::ui::{
+    ClickableRegions, Component, ComponentContext, Effect, HandlerContext, HostView, TAB_COUNT,
+    UiState, fade_scroll_edges, panel_block, theme, try_handle_pane_scroll, try_handle_pane_wheel,
+    widgets::scrollbar::draw_scrollbar, widgets::tabs_bar::TAB_TITLES,
+};
 
-/// Stateless help tab. Zero-sized — held in the tabs vec like any
-/// other Component, even though it never mutates.
-pub(in crate::ui) struct HelpTab;
+// Compile-time tripwire: adding a tab must also add a `HelpContext`
+// variant, `from_state` arm, and key tables, or the new tab would
+// silently render another view's help.
+const _: () = assert!(TAB_COUNT == 5, "update HelpContext for the new tab");
 
-impl Component for HelpTab {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpContext {
+    Overview,
+    Details,
+    Activity,
+    Graph,
+    HostSockets,
+    HostInterfaces,
+}
+
+impl HelpContext {
+    fn from_state(ui_state: &UiState) -> Self {
+        match ui_state.selected_tab {
+            0 => Self::Overview,
+            1 => Self::Details,
+            2 => Self::Activity,
+            3 => Self::Graph,
+            4 => match ui_state.host_view {
+                HostView::Sockets => Self::HostSockets,
+                HostView::Interfaces => Self::HostInterfaces,
+            },
+            // `selected_tab` is always < TAB_COUNT (jump_to_tab / next_tab
+            // enforce it); the tripwire above keeps this match exhaustive.
+            _ => Self::Overview,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Overview => TAB_TITLES[0],
+            Self::Details => TAB_TITLES[1],
+            Self::Activity => TAB_TITLES[2],
+            Self::Graph => TAB_TITLES[3],
+            Self::HostSockets => "Host · Sockets",
+            Self::HostInterfaces => "Host · Interfaces",
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Overview => "Inspect, filter, group, and sort captured connections.",
+            Self::Details => "Inspect the currently selected connection.",
+            Self::Activity => "Compare retained traffic by process.",
+            Self::Graph => "Review live traffic, protocol, and connection charts.",
+            Self::HostSockets => "Inspect the OS socket table: listeners, bound endpoints, states.",
+            Self::HostInterfaces => "Inspect traffic and counters for each interface.",
+        }
+    }
+}
+
+/// Help overlay. Its state lives in `UiState` so opening it does not replace
+/// the active tab or lose the user's position in that tab.
+pub(in crate::ui) struct HelpOverlay;
+
+impl Component for HelpOverlay {
     fn draw(
         &mut self,
         f: &mut Frame,
         area: Rect,
-        _ctx: &ComponentContext<'_>,
+        ctx: &ComponentContext<'_>,
         _click_regions: &mut ClickableRegions,
     ) -> Result<()> {
-        draw_help(f, area)
+        draw_help_overlay(f, ctx.ui_state, area)
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, ctx: &mut HandlerContext<'_>) -> Option<Vec<Effect>> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('h'), _) | (KeyCode::Esc, _) => {
+                ctx.ui_state.show_help = false;
+                ctx.ui_state.help_scroll.reset();
+                Some(Vec::new())
+            }
+            // Every key GLOBAL_KEYS advertises must stay live while the
+            // overlay is open: quit, clear, and tab navigation fall through
+            // to the global fallback in main.rs. Tab switches leave the
+            // overlay up and it re-renders for the newly active view.
+            (KeyCode::Char('q'), _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('x'), _)
+            | (KeyCode::Tab, _)
+            | (KeyCode::BackTab, _)
+            | (KeyCode::Char('[' | ']'), KeyModifiers::NONE)
+            | (KeyCode::Char('1'..='5'), KeyModifiers::NONE) => None,
+            _ => {
+                let page = ctx.ui_state.help_scroll.viewport_rows() as usize;
+                try_handle_pane_scroll(key, page, &mut ctx.ui_state.help_scroll)
+                    .or_else(|| Some(Vec::new()))
+            }
+        }
+    }
+
+    fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        ctx: &mut HandlerContext<'_>,
+    ) -> Option<Vec<Effect>> {
+        if let MouseEventKind::Down(_) = mouse.kind {
+            // A click anywhere dismisses the overlay (the mouse equivalent
+            // of Esc); claiming the event also keeps the click from
+            // activating controls in the obscured view. Mirror the
+            // click preamble in main.rs that this claim short-circuits:
+            // a click cancels pending confirmations everywhere else too.
+            ctx.ui_state.show_help = false;
+            ctx.ui_state.help_scroll.reset();
+            ctx.ui_state.quit_confirmation = false;
+            ctx.ui_state.clear_confirmation = false;
+            return Some(Vec::new());
+        }
+        // Wheel scrolling via the shared pane helper; Moved/Drag/Up stay
+        // unclaimed so pointer motion does not force redraws.
+        try_handle_pane_wheel(mouse, &mut ctx.ui_state.help_scroll)
     }
 }
 
-pub(in crate::ui) fn draw_help(f: &mut Frame, area: Rect) -> Result<()> {
-    let help_text: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled("RustNet Monitor ", theme::bold_fg(theme::ok())),
-            Span::raw("- Network Connection Monitor"),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("q ", theme::fg(theme::key())),
-            Span::raw("Quit application (press twice to confirm)"),
-        ]),
-        Line::from(vec![
-            Span::styled("Ctrl+C ", theme::fg(theme::key())),
-            Span::raw("Quit immediately"),
-        ]),
-        Line::from(vec![
-            Span::styled("x ", theme::fg(theme::key())),
-            Span::raw("Clear all connections (press twice to confirm)"),
-        ]),
-        Line::from(vec![
-            Span::styled("Tab, ] ", theme::fg(theme::key())),
-            Span::raw("Next tab"),
-        ]),
-        Line::from(vec![
-            Span::styled("Shift+Tab, [ ", theme::fg(theme::key())),
-            Span::raw("Previous tab"),
-        ]),
-        Line::from(vec![
-            Span::styled("1-5 ", theme::fg(theme::key())),
-            Span::raw(
-                "Jump directly to a tab (1=Overview, 2=Details, 3=Interfaces, 4=Graph, 5=Help)",
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("↑/k, ↓/j ", theme::fg(theme::key())),
-            Span::raw("Navigate connections (wraps around)"),
-        ]),
-        Line::from(vec![
-            Span::styled("g, G ", theme::fg(theme::key())),
-            Span::raw("Jump to first/last connection (vim-style)"),
-        ]),
-        Line::from(vec![
-            Span::styled("Page Up/Down, Ctrl+B/F ", theme::fg(theme::key())),
-            Span::raw("Navigate connections by page"),
-        ]),
-        Line::from(vec![
-            Span::styled("c ", theme::fg(theme::key())),
-            Span::raw("Copy remote address to clipboard"),
-        ]),
-        Line::from(vec![
-            Span::styled("p ", theme::fg(theme::key())),
-            Span::raw("Toggle between service names and port numbers"),
-        ]),
-        Line::from(vec![
-            Span::styled("d ", theme::fg(theme::key())),
-            Span::raw("Toggle between hostnames and IP addresses (when --resolve-dns)"),
-        ]),
-        Line::from(vec![
-            Span::styled("s ", theme::fg(theme::key())),
-            Span::raw("Cycle through sort columns (Bandwidth, Process, etc.)"),
-        ]),
-        Line::from(vec![
-            Span::styled("S ", theme::fg(theme::key())),
-            Span::raw("Toggle sort direction (ascending/descending)"),
-        ]),
-        Line::from(vec![
-            Span::styled("a ", theme::fg(theme::key())),
-            Span::raw("Toggle process grouping (aggregate by process)"),
-        ]),
-        Line::from(vec![
-            Span::styled("Space ", theme::fg(theme::key())),
-            Span::raw("Expand/collapse group (when grouping enabled)"),
-        ]),
-        Line::from(vec![
-            Span::styled("←/→ or h/l ", theme::fg(theme::key())),
-            Span::raw("Collapse/expand group"),
-        ]),
-        Line::from(vec![
-            Span::styled("t ", theme::fg(theme::key())),
-            Span::raw("Toggle display of historic (closed) connections"),
-        ]),
-        Line::from(vec![
-            Span::styled("r ", theme::fg(theme::key())),
-            Span::raw("Reset view (grouping, sort, filter)"),
-        ]),
-        Line::from(vec![
-            Span::styled("Enter ", theme::fg(theme::key())),
-            Span::raw("View connection details"),
-        ]),
-        Line::from(vec![
-            Span::styled("Esc ", theme::fg(theme::key())),
-            Span::raw("Return to overview"),
-        ]),
-        Line::from(vec![
-            Span::styled("h ", theme::fg(theme::key())),
-            Span::raw("Toggle this help screen"),
-        ]),
-        Line::from(vec![
-            Span::styled("/ ", theme::fg(theme::key())),
-            Span::raw(
-                "Enter filter mode on Overview (use \u{2191}/\u{2193} to navigate while typing)",
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled("Tabs:", theme::bold_fg(theme::accent()))]),
-        Line::from(vec![
-            Span::styled("  Overview ", theme::fg(theme::ok())),
-            Span::raw("Connection list with mini traffic graph"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Details ", theme::fg(theme::ok())),
-            Span::raw("Full details for selected connection"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Interfaces ", theme::fg(theme::ok())),
-            Span::raw("Network interface statistics"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Graph ", theme::fg(theme::ok())),
-            Span::raw("Traffic charts and protocol distribution"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Help ", theme::fg(theme::ok())),
-            Span::raw("This help screen"),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Mouse Controls:",
-            theme::bold_fg(theme::accent()),
-        )]),
-        Line::from(vec![
-            Span::styled("  Click tab ", theme::fg(theme::key())),
-            Span::raw("Switch between tabs"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Click row ", theme::fg(theme::key())),
-            Span::raw("Select connection"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Scroll wheel ", theme::fg(theme::key())),
-            Span::raw("Navigate connection list"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Double-click row ", theme::fg(theme::key())),
-            Span::raw("Open connection details"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Double-click group ", theme::fg(theme::key())),
-            Span::raw("Expand/collapse process group"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Click field (Details) ", theme::fg(theme::key())),
-            Span::raw("Copy field value to clipboard"),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Connection Colors:",
-            theme::bold_fg(theme::accent()),
-        )]),
-        Line::from(vec![
-            Span::styled("  White ", Style::default()),
-            Span::raw("Active connection (< 75% of timeout)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Yellow ", theme::fg(theme::key())),
-            Span::raw("Stale connection (75-90% of timeout)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Red ", theme::fg(theme::err())),
-            Span::raw("Critical - will be removed soon (> 90% of timeout)"),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Filter Examples:",
-            theme::bold_fg(theme::accent()),
-        )]),
-        Line::from(vec![
-            Span::styled("  /google ", theme::fg(theme::ok())),
-            Span::raw("Search for 'google' in all fields"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /port:22 ", theme::fg(theme::ok())),
-            Span::raw("Exact port match (only port 22, not 2223 or 5522)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /port:/22/ ", theme::fg(theme::ok())),
-            Span::raw("Regex port match (22, 220, 5522, etc.)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /src:192.168 ", theme::fg(theme::ok())),
-            Span::raw("Filter by source IP prefix"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /dst:github.com ", theme::fg(theme::ok())),
-            Span::raw("Filter by destination"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /sni:/.*github.*/ ", theme::fg(theme::ok())),
-            Span::raw("Regex SNI match (wrap value in /…/ for regex)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /process:firefox ", theme::fg(theme::ok())),
-            Span::raw("Filter by process name"),
-        ]),
-        Line::from(""),
-    ];
+type HelpRow = (&'static str, &'static str);
 
-    let help = Paragraph::new(help_text)
-        .block(panel_block("Help"))
-        .style(Style::default())
-        .wrap(Wrap { trim: true })
-        .alignment(ratatui::layout::Alignment::Left);
+// Only list keys here that the overlay's `handle_key` lets fall through
+// to the global fallback in main.rs, so everything this section
+// advertises works while the overlay is open.
+const GLOBAL_KEYS: &[HelpRow] = &[
+    ("Tab, ]", "Next tab"),
+    ("Shift+Tab, [", "Previous tab"),
+    ("1-5", "Jump to Overview, Details, Activity, Graph, or Host"),
+    ("x", "Clear all connections (press twice)"),
+    ("h, Esc", "Close this help overlay"),
+    ("q", "Quit application (press twice to confirm)"),
+    ("Ctrl+C", "Quit immediately"),
+];
 
-    f.render_widget(help, area);
+const CONNECTION_NAV_KEYS: &[HelpRow] = &[
+    ("↑/k, ↓/j", "Select previous or next connection"),
+    ("g, G", "Jump to first or last connection"),
+    ("Page Up/Down", "Move by one page"),
+    ("Ctrl+B/F", "Move by one page"),
+];
 
+const OVERVIEW_KEYS: &[HelpRow] = &[
+    ("Enter", "Open the selected connection in Details"),
+    ("/", "Enter filter mode"),
+    ("Esc", "Clear the active filter"),
+    ("c", "Copy the selected remote address"),
+    ("p", "Toggle service names and port numbers"),
+    ("d", "Toggle hostnames and IP addresses"),
+    ("s, S", "Change sort column or direction"),
+    ("a", "Toggle process grouping"),
+    ("Space", "Expand or collapse the selected group"),
+    ("←/→, l", "Collapse or expand the selected group"),
+    ("t", "Toggle historic connections"),
+    ("i", "Toggle the System info panel"),
+    ("r", "Reset grouping, sorting, filter, and history"),
+];
+
+const FILTER_EXAMPLES: &[HelpRow] = &[
+    ("/google", "Search all connection fields"),
+    ("/port:22", "Match port 22 exactly"),
+    ("/src:192.168", "Match a source address prefix"),
+    ("/dst:github.com", "Match a destination"),
+    ("/process:firefox", "Match a process name"),
+    ("/state:established", "Match connection state"),
+    ("/port:/22/", "Regex port match (22, 220, 5522, ...)"),
+    (
+        "/sni:/.*github.*/",
+        "Regex SNI match; /.../ works on any field",
+    ),
+];
+
+const OVERVIEW_MOUSE: &[HelpRow] = &[
+    ("Click row", "Select a connection"),
+    ("Double-click row", "Open connection details"),
+    ("Double-click group", "Expand or collapse a process group"),
+    ("Scroll wheel", "Navigate the connection list"),
+];
+
+// Shown for both Overview and Details: the Details tab keeps the
+// connection table (and its Health column) above the cards.
+const CONNECTION_DISPLAY: &[HelpRow] = &[
+    ("Full color", "Active connection"),
+    (
+        "Countdown",
+        "Idle; the ▎ stripe and ↓/↑ countdown run yellow to red until removal",
+    ),
+    ("Gray", "Historic closed connection"),
+    ("~name", "Hostname inferred from an observed DNS response"),
+    ("App column", "Application protocol, SNI, or HTTP Host"),
+    (
+        "R3/O1",
+        "Health for TCP: retransmits and out-of-order packets",
+    ),
+    (
+        "R1/V0",
+        "Health for QUIC: Retry and Version Negotiation packets",
+    ),
+    ("R2/T1", "Health for UDP requests: retries and timeouts"),
+    ("ok, -", "Healthy connection, or an ungraded protocol"),
+    ("R+", "Counts of 10 or more; Details has the exact numbers"),
+];
+
+const DETAILS_KEYS: &[HelpRow] = &[
+    ("↑/k, ↓/j", "Show the previous or next connection"),
+    ("g, G", "Show the first or last connection"),
+    ("Page Up/Down", "Move through connections by one page"),
+    ("Ctrl+B/F", "Move through connections by one page"),
+    ("Ctrl+D/U", "Scroll the connection information panes"),
+    ("c", "Copy the remote address"),
+    ("Esc", "Return to Overview"),
+];
+
+const DETAILS_CONCEPTS: &[HelpRow] = &[
+    (
+        "Window Size",
+        "Advertised receive windows: ↓ this host's, ↑ the remote's",
+    ),
+    (
+        "unknown window",
+        "Scaling is announced only in a handshake rustnet did not see",
+    ),
+    (
+        "Initial RTT",
+        "Blank without a captured handshake; Live RTT still measures",
+    ),
+];
+
+const DETAILS_MOUSE: &[HelpRow] = &[
+    ("Click field", "Copy that field's value"),
+    (
+        "Click connection",
+        "Select a connection in the continuity strip",
+    ),
+    ("Scroll wheel", "Scroll the connection information panes"),
+];
+
+const ACTIVITY_KEYS: &[HelpRow] = &[
+    ("d", "Toggle Egress (TX) and Ingress (RX)"),
+    ("s", "Cycle the process sort column"),
+    ("S", "Reverse the sort direction"),
+    ("Esc", "Return to Overview"),
+];
+
+const ACTIVITY_CONCEPTS: &[HelpRow] = &[
+    (
+        "60s coverage",
+        "Captured connection traffic divided by interface traffic",
+    ),
+    (
+        "Retained",
+        "Active traffic plus recently closed connections",
+    ),
+    (
+        "Unknown",
+        "Traffic that could not be attributed to a process",
+    ),
+    (
+        "Top remote peer",
+        "Highest-volume peer for the selected direction",
+    ),
+];
+
+const HOST_SOCKET_KEYS: &[HelpRow] = &[
+    ("↑/k, ↓/j", "Scroll one line"),
+    ("Page Up/Down", "Scroll one page"),
+    ("Ctrl+B/F", "Scroll one page"),
+    ("g, G", "Jump to the top or bottom"),
+    ("i, →", "Show interface details"),
+    ("Esc", "Return to Overview"),
+    ("Scroll wheel", "Scroll the endpoint table"),
+];
+
+const HOST_SOCKET_CONCEPTS: &[HelpRow] = &[
+    (
+        "LISTEN",
+        "TCP socket awaiting connections, from the OS socket table",
+    ),
+    ("BOUND", "UDP endpoint; UDP has no LISTEN state"),
+    (
+        "Observed RTT",
+        "Measured from captured packets, not the socket table",
+    ),
+    ("Refresh", "The socket inventory rescans every 5 seconds"),
+];
+
+const INTERFACE_KEYS: &[HelpRow] = &[
+    ("↑/k, ↓/j", "Scroll one line"),
+    ("Page Up/Down", "Scroll one page"),
+    ("Ctrl+B/F", "Scroll one page"),
+    ("g, G", "Jump to the top or bottom"),
+    ("s, ←", "Return to the socket inventory"),
+    ("Esc", "Return to Overview"),
+    ("Scroll wheel", "Scroll interface details"),
+];
+
+const GRAPH_KEYS: &[HelpRow] = &[
+    ("Esc", "Return to Overview"),
+    (
+        "Live view",
+        "Charts update automatically; no graph controls are required",
+    ),
+];
+
+const ROW_INDENT: &str = "  ";
+const COLUMN_GAP: &str = "  ";
+
+fn key_column_width(rows: &[HelpRow]) -> usize {
+    rows.iter()
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+fn tick_line(title: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("▎", theme::fg(theme::accent())),
+        Span::styled(
+            format!(" {title}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn column_row(key: &str, description: &'static str, width: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(ROW_INDENT),
+        Span::styled(format!("{key:<width$}"), theme::key_hint()),
+        Span::raw(COLUMN_GAP),
+        Span::styled(description, theme::key_hint_label()),
+    ])
+}
+
+fn push_section(out: &mut Vec<Line<'static>>, title: &'static str, rows: &'static [HelpRow]) {
+    out.push(Line::from(""));
+    out.push(tick_line(title));
+    let width = key_column_width(rows);
+    out.extend(
+        rows.iter()
+            .map(|&(key, description)| column_row(key, description, width)),
+    );
+}
+
+fn help_lines(context: HelpContext) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        context.summary(),
+        theme::key_hint_label(),
+    ))];
+
+    match context {
+        HelpContext::Overview => {
+            push_section(&mut lines, "Connection Navigation", CONNECTION_NAV_KEYS);
+            push_section(&mut lines, "Overview Actions", OVERVIEW_KEYS);
+            push_section(&mut lines, "Connection Display", CONNECTION_DISPLAY);
+            push_section(&mut lines, "Filter Examples", FILTER_EXAMPLES);
+            push_section(&mut lines, "Mouse", OVERVIEW_MOUSE);
+        }
+        HelpContext::Details => {
+            push_section(&mut lines, "Details Actions", DETAILS_KEYS);
+            push_section(&mut lines, "Transport Health", DETAILS_CONCEPTS);
+            push_section(&mut lines, "Connection Display", CONNECTION_DISPLAY);
+            push_section(&mut lines, "Mouse", DETAILS_MOUSE);
+        }
+        HelpContext::Activity => {
+            push_section(&mut lines, "Activity Actions", ACTIVITY_KEYS);
+            push_section(&mut lines, "Activity Concepts", ACTIVITY_CONCEPTS);
+        }
+        HelpContext::Graph => {
+            push_section(&mut lines, "Graph", GRAPH_KEYS);
+        }
+        HelpContext::HostSockets => {
+            push_section(&mut lines, "Socket Actions", HOST_SOCKET_KEYS);
+            push_section(&mut lines, "Socket Concepts", HOST_SOCKET_CONCEPTS);
+        }
+        HelpContext::HostInterfaces => {
+            push_section(&mut lines, "Interface Actions", INTERFACE_KEYS);
+        }
+    }
+    push_section(&mut lines, "Global", GLOBAL_KEYS);
+    lines.push(Line::from(""));
+    lines
+}
+
+/// Popup width: near-full width on small terminals, capped for readability.
+fn overlay_width(area: Rect) -> u16 {
+    area.width.saturating_sub(4).max(1).min(area.width).min(92)
+}
+
+fn overlay_area(area: Rect, width: u16, content_rows: usize) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let available_height = area.height.saturating_sub(2).max(1).min(area.height);
+    let content_rows = u16::try_from(content_rows).unwrap_or(u16::MAX);
+    let height = available_height.min(content_rows.saturating_add(2).min(32));
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+pub(in crate::ui) fn draw_help_overlay(
+    f: &mut Frame,
+    ui_state: &UiState,
+    area: Rect,
+) -> Result<()> {
+    if area.width == 0 || area.height == 0 {
+        return Ok(());
+    }
+    let context = HelpContext::from_state(ui_state);
+    let mut lines = help_lines(context);
+    let total_lines = lines.len();
+
+    let width = overlay_width(area);
+    // Room the text really gets: borders (2) + horizontal padding (2) +
+    // the gutter (2) that keeps text clear of the scrollbar thumb.
+    let text_width = width.saturating_sub(6);
+    // Wrap-aware extent: on narrow popups lines wrap, so the popup height
+    // and the scroll range must count rendered rows, not source lines,
+    // or the tail of the help would be unreachable.
+    let content_rows = if text_width == 0 {
+        total_lines
+    } else {
+        Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(text_width)
+    };
+    let popup = overlay_area(area, width, content_rows);
+    if popup.width == 0 || popup.height == 0 {
+        return Ok(());
+    }
+
+    let base_block =
+        panel_block(format!(" Help · {} ", context.title())).padding(Padding::horizontal(1));
+    let inner = base_block.inner(popup);
+    let max_scroll = u16::try_from(content_rows)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(inner.height);
+    let scroll = ui_state.help_scroll.clamp_for_render(max_scroll);
+    ui_state.help_scroll.record_viewport(inner.height);
+
+    // The edge fade indexes into the source lines, which only lines up
+    // with rendered rows while nothing wraps; skip the cosmetic fade
+    // otherwise.
+    if content_rows == total_lines {
+        fade_scroll_edges(&mut lines, scroll, inner.height);
+    }
+
+    f.render_widget(Clear, popup);
+    f.render_widget(base_block, popup);
+    let text_area = Rect {
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    let help = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(help, text_area);
+    draw_scrollbar(
+        f,
+        inner,
+        content_rows,
+        scroll as usize,
+        inner.height as usize,
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::test_support::{empty_ctx, render, test_app};
+
+    fn plain_text(ui_state: &UiState) -> String {
+        help_lines(HelpContext::from_state(ui_state))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn overview_help_contains_filtering() {
+        let text = plain_text(&UiState::default());
+        assert!(text.contains("Filter Examples"));
+        assert!(text.contains("/port:22"));
+    }
+
+    #[test]
+    fn details_help_excludes_overview_actions() {
+        let state = UiState {
+            selected_tab: 1,
+            ..UiState::default()
+        };
+        let text = plain_text(&state);
+        assert!(text.contains("Details Actions"));
+        // The connection table (and its Health column) stays visible on
+        // Details, so its display legend is shared with Overview.
+        assert!(text.contains("Connection Display"));
+        assert!(!text.contains("Filter Examples"));
+        assert!(!text.contains("process grouping"));
+    }
+
+    #[test]
+    fn host_subviews_have_distinct_help() {
+        let sockets = UiState {
+            selected_tab: 4,
+            ..UiState::default()
+        };
+        let text = plain_text(&sockets);
+        assert!(text.contains("Socket Actions"));
+        assert!(!text.contains("Interface Actions"));
+
+        let interfaces = UiState {
+            selected_tab: 4,
+            host_view: HostView::Interfaces,
+            ..UiState::default()
+        };
+        let text = plain_text(&interfaces);
+        assert!(text.contains("Interface Actions"));
+        assert!(!text.contains("Socket Actions"));
+    }
+
+    #[test]
+    fn overlay_stays_inside_small_areas() {
+        let parent = Rect::new(3, 4, 8, 3);
+        let popup = overlay_area(parent, overlay_width(parent), 50);
+        assert!(popup.x >= parent.x && popup.y >= parent.y);
+        assert!(popup.right() <= parent.right());
+        assert!(popup.bottom() <= parent.bottom());
+    }
+
+    #[test]
+    fn overlay_renders_on_a_minimal_terminal() {
+        let ui_state = UiState {
+            show_help: true,
+            ..UiState::default()
+        };
+        render(8, 3, |frame| {
+            draw_help_overlay(frame, &ui_state, frame.area()).expect("draw help overlay")
+        });
+    }
+
+    #[test]
+    fn closing_help_preserves_the_underlying_view() {
+        let app = test_app();
+        let mut ui_state = UiState {
+            selected_tab: 1,
+            show_help: true,
+            filter_query: "port:443".to_string(),
+            ..UiState::default()
+        };
+        let click_regions = ClickableRegions::default();
+        let mut ctx = empty_ctx(&app, &mut ui_state, &click_regions);
+
+        let effects =
+            HelpOverlay.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ctx);
+
+        assert!(matches!(effects, Some(effects) if effects.is_empty()));
+        assert!(!ctx.ui_state.show_help);
+        assert_eq!(ctx.ui_state.selected_tab, 1);
+        assert_eq!(ctx.ui_state.filter_query, "port:443");
+    }
+
+    #[test]
+    fn overlay_consumes_view_actions_but_keeps_quit_global() {
+        let app = test_app();
+        let mut ui_state = UiState {
+            show_help: true,
+            ..UiState::default()
+        };
+        let click_regions = ClickableRegions::default();
+        let mut ctx = empty_ctx(&app, &mut ui_state, &click_regions);
+
+        assert!(
+            HelpOverlay
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                    &mut ctx,
+                )
+                .is_some()
+        );
+        assert!(!ctx.ui_state.filter_mode);
+        // Every key the overlay's Global section advertises must fall
+        // through (None) so main.rs's global fallback can act on it.
+        for key in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        ] {
+            assert!(
+                HelpOverlay.handle_key(key, &mut ctx).is_none(),
+                "{key:?} should fall through to the global fallback"
+            );
+        }
+        assert!(ctx.ui_state.show_help);
+    }
+
+    #[test]
+    fn click_dismisses_overlay_and_motion_stays_unclaimed() {
+        use crossterm::event::MouseButton;
+
+        let app = test_app();
+        let mut ui_state = UiState {
+            show_help: true,
+            quit_confirmation: true,
+            ..UiState::default()
+        };
+        let click_regions = ClickableRegions::default();
+        let mut ctx = empty_ctx(&app, &mut ui_state, &click_regions);
+
+        let motion = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Pointer motion must stay unclaimed or every move forces a redraw.
+        assert!(HelpOverlay.handle_mouse(motion, &mut ctx).is_none());
+        assert!(ctx.ui_state.show_help);
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..motion
+        };
+        assert!(HelpOverlay.handle_mouse(click, &mut ctx).is_some());
+        assert!(!ctx.ui_state.show_help);
+        assert!(!ctx.ui_state.quit_confirmation);
+    }
+
+    #[test]
+    fn narrow_overlay_can_scroll_to_the_last_line() {
+        fn render_overlay(ui_state: &UiState) -> String {
+            render(46, 20, |frame| {
+                draw_help_overlay(frame, ui_state, frame.area()).expect("draw help overlay")
+            })
+        }
+
+        // At this width several help rows wrap onto two rendered rows, so
+        // the scroll range must be computed from wrapped rows or the tail
+        // of the Global section becomes unreachable.
+        let mut ui_state = UiState {
+            show_help: true,
+            ..UiState::default()
+        };
+        let first = render_overlay(&ui_state);
+        assert!(!first.contains("Quit immediately"));
+        ui_state.help_scroll.scroll_to_bottom();
+        let bottom = render_overlay(&ui_state);
+        assert!(bottom.contains("Quit immediately"));
+    }
 }

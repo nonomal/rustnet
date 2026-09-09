@@ -13,14 +13,18 @@ mod mdns;
 mod mqtt;
 mod netbios;
 mod ntp;
+mod openvpn;
 mod quic;
 mod snmp;
 mod ssdp;
 mod ssh;
 mod stun;
+mod tls_common;
+mod wireguard;
 
-pub use cipher_suites::{format_cipher_suite, is_secure_cipher_suite};
-pub use quic::{is_partial_sni, try_extract_tls_from_reassembler};
+pub(crate) use cipher_suites::{format_cipher_suite, is_secure_cipher_suite};
+pub(crate) use quic::try_extract_tls_from_reassembler;
+pub(crate) use tls_common::is_partial_sni;
 
 // Well-known port numbers used for DPI protocol detection.
 const PORT_SSH: u16 = 22;
@@ -40,6 +44,7 @@ const PORT_MDNS: u16 = 5353;
 const PORT_STUN: u16 = 3478;
 const PORT_STUN_TLS: u16 = 5349;
 const PORT_LLMNR: u16 = 5355;
+const PORT_OPENVPN: u16 = 1194;
 
 /// Result of DPI analysis
 #[derive(Debug, Clone)]
@@ -48,7 +53,7 @@ pub struct DpiResult {
 }
 
 /// Analyze a TCP packet payload
-pub fn analyze_tcp_packet(
+pub(crate) fn analyze_tcp_packet(
     payload: &[u8],
     local_port: u16,
     remote_port: u16,
@@ -104,8 +109,9 @@ pub fn analyze_tcp_packet(
     }
 
     // 6. Check for FTP control channel (port 21 plaintext / AUTH TLS upgrade,
-    //    or signature). Runs before more generic protocols since the start
-    //    line is unambiguous (3-digit reply code OR a small known command set).
+    //    or signature). Off port 21 only distinctively-FTP commands count as
+    //    a signature; 3-digit reply lines are shared with SMTP/POP3/NNTP and
+    //    are only classified on port 21.
     //
     //    Implicit FTPS on port 990 is intentionally NOT routed here: that
     //    flow is TLS from the very first byte and falls through to the
@@ -119,13 +125,25 @@ pub fn analyze_tcp_packet(
         });
     }
 
+    // 7. OpenVPN over TCP uses a two-byte length prefix. On its registered
+    // port we accept all current packet opcodes; elsewhere the analyzer only
+    // accepts a distinctive hard-reset exchange.
+    if let Some(openvpn_result) = openvpn::analyze_openvpn_tcp(
+        payload,
+        local_port == PORT_OPENVPN || remote_port == PORT_OPENVPN,
+    ) {
+        return Some(DpiResult {
+            application: ApplicationProtocol::OpenVpn(openvpn_result),
+        });
+    }
+
     // More protocols here...
 
     None
 }
 
 /// Analyze a UDP packet payload
-pub fn analyze_udp_packet(
+pub(crate) fn analyze_udp_packet(
     payload: &[u8],
     local_port: u16,
     remote_port: u16,
@@ -254,7 +272,25 @@ pub fn analyze_udp_packet(
         });
     }
 
-    // 12. BitTorrent DHT / uTP (no port gating — signature-based)
+    // 12. WireGuard (fixed message types, reserved bytes, and lengths)
+    if let Some(wireguard_result) = wireguard::analyze_wireguard(payload) {
+        return Some(DpiResult {
+            application: ApplicationProtocol::WireGuard(wireguard_result),
+        });
+    }
+
+    // 13. OpenVPN. The registered port permits all structurally plausible
+    // opcodes; alternate ports require a distinctive hard-reset exchange.
+    if let Some(openvpn_result) = openvpn::analyze_openvpn_udp(
+        payload,
+        local_port == PORT_OPENVPN || remote_port == PORT_OPENVPN,
+    ) {
+        return Some(DpiResult {
+            application: ApplicationProtocol::OpenVpn(openvpn_result),
+        });
+    }
+
+    // 14. BitTorrent DHT / uTP (no port gating, signature-based)
     if let Some(bt_result) = bittorrent::analyze_udp_bittorrent(payload) {
         return Some(DpiResult {
             application: ApplicationProtocol::BitTorrent(bt_result),
@@ -262,4 +298,55 @@ pub fn analyze_udp_packet(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::types::{OpenVpnPacketType, WireGuardPacketType};
+
+    #[test]
+    fn dispatches_wireguard_before_bittorrent() {
+        let mut payload = vec![0x5a; 148];
+        payload[..4].copy_from_slice(&[1, 0, 0, 0]);
+
+        let result = analyze_udp_packet(&payload, 50_000, 51_820, true).unwrap();
+        let ApplicationProtocol::WireGuard(info) = result.application else {
+            panic!("expected WireGuard classification");
+        };
+        assert_eq!(info.packet_type, WireGuardPacketType::HandshakeInitiation);
+    }
+
+    #[test]
+    fn dispatches_openvpn_udp_on_registered_port() {
+        let mut payload = vec![0x5a; 20];
+        payload[0] = 9 << 3;
+
+        let result = analyze_udp_packet(&payload, 50_000, PORT_OPENVPN, true).unwrap();
+        let ApplicationProtocol::OpenVpn(info) = result.application else {
+            panic!("expected OpenVPN classification");
+        };
+        assert_eq!(info.packet_type, OpenVpnPacketType::DataV2);
+    }
+
+    #[test]
+    fn dispatches_openvpn_tcp_frame() {
+        let mut packet = vec![0x5a; 14];
+        packet[0] = 7 << 3;
+        packet[9..].fill(0);
+        let mut frame = Vec::with_capacity(16);
+        frame.extend_from_slice(&14u16.to_be_bytes());
+        frame.extend_from_slice(&packet);
+
+        let result = analyze_tcp_packet(&frame, 50_000, PORT_OPENVPN, true).unwrap();
+        assert!(matches!(
+            result.application,
+            ApplicationProtocol::OpenVpn(_)
+        ));
+    }
+
+    #[test]
+    fn registered_port_alone_does_not_classify_random_udp() {
+        assert!(analyze_udp_packet(b"not an OpenVPN packet", 50_000, PORT_OPENVPN, true).is_none());
+    }
 }

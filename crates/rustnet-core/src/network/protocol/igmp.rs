@@ -1,9 +1,9 @@
 //! IGMP (Internet Group Management Protocol) parsing
 
 use crate::network::parser::ParsedPacket;
-use crate::network::protocol::TransportParams;
+use crate::network::protocol::{TransportParams, orient_endpoints};
 use crate::network::types::{Protocol, ProtocolState};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 
 /// Parse an IGMP packet
 ///
@@ -30,7 +30,7 @@ pub fn parse(
 
     let igmp_type = transport_data[0];
 
-    // IGMPv3 Membership Reports (0x22) have no single group address —
+    // IGMPv3 Membership Reports (0x22) have no single group address:
     // bytes 4–5 are reserved and bytes 6–7 are the number of group records.
     // Only IGMPv1/v2 messages carry a group address in bytes 4–7.
     let group_addr = if igmp_type != 0x22 && transport_data.len() >= 8 {
@@ -44,36 +44,21 @@ pub fn parse(
         None
     };
 
-    let is_outgoing = local_ips.contains(&params.src_ip);
+    let (local_addr, remote_addr, is_outgoing) = orient_endpoints(&params, 0, 0, local_ips);
 
-    let (local_addr, remote_addr) = if is_outgoing {
-        (
-            SocketAddr::new(params.src_ip, 0),
-            SocketAddr::new(params.dst_ip, 0),
-        )
-    } else {
-        (
-            SocketAddr::new(params.dst_ip, 0),
-            SocketAddr::new(params.src_ip, 0),
-        )
-    };
-
-    Some(ParsedPacket {
-        connection_key: format!("IGMP:{}-IGMP:{}", local_addr, remote_addr),
-        protocol: Protocol::Igmp,
+    Some(ParsedPacket::new(
+        Protocol::Igmp,
         local_addr,
         remote_addr,
-        tcp_header: None,
-        protocol_state: ProtocolState::Igmp {
+        ProtocolState::Igmp {
             igmp_type,
             group_addr,
         },
         is_outgoing,
-        packet_len: params.packet_len,
-        dpi_result: None,
-        process_name: params.process_name,
-        process_id: params.process_id,
-    })
+        params.packet_len,
+        params.process_name,
+        params.process_id,
+    ))
 }
 
 #[cfg(test)]

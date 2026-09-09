@@ -1,5 +1,18 @@
 use clap::{Arg, Command};
 
+/// Built-in theme preset names. Spelled out as literals because build.rs
+/// `include!`s this file and cannot reach `crate::ui`; a unit test in
+/// `ui::theme::definitions` asserts the list stays in sync with
+/// `ThemePreset::ALL`.
+pub const THEME_PRESETS: [&str; 6] = [
+    "muted",
+    "vivid",
+    "catppuccin-mocha",
+    "tokyo-night",
+    "gruvbox",
+    "nord",
+];
+
 #[cfg(target_os = "linux")]
 const INTERFACE_HELP: &str = "Network interface to monitor (use \"any\" to capture all interfaces)";
 
@@ -45,7 +58,7 @@ pub fn build_cli() -> Command {
                 .value_name("MILLISECONDS")
                 .help("UI refresh interval in milliseconds")
                 .value_parser(clap::value_parser!(u64))
-                .default_value("1000")
+                .default_value("500")
                 .required(false),
         )
         .arg(
@@ -77,6 +90,13 @@ pub fn build_cli() -> Command {
                 .required(false),
         )
         .arg(
+            Arg::new("pcapng-export")
+                .long("pcapng-export")
+                .value_name("FILE")
+                .help("Export captured packets to annotated PCAPNG file for Wireshark analysis")
+                .required(false),
+        )
+        .arg(
             Arg::new("bpf-filter")
                 .short('f')
                 .long("bpf-filter")
@@ -103,6 +123,14 @@ pub fn build_cli() -> Command {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("theme")
+                .long("theme")
+                .value_name("PRESET")
+                .help("Color theme: muted (default), vivid, catppuccin-mocha, tokyo-night, gruvbox, nord. Overrides the theme set in the config file (~/.config/rustnet/config.toml)")
+                .value_parser(THEME_PRESETS)
+                .required(false),
+        )
+        .arg(
             Arg::new("geoip-country")
                 .long("geoip-country")
                 .value_name("PATH")
@@ -127,7 +155,7 @@ pub fn build_cli() -> Command {
                 .value_name("PATH")
                 .help(
                     "Path to GeoLite2-City.mmdb database (same search paths as --geoip-country; \
-                     superset of Country — provides city name and postal code in addition to country)",
+                     superset of Country: provides city name and postal code in addition to country)",
                 )
                 .required(false),
         )
@@ -138,16 +166,27 @@ pub fn build_cli() -> Command {
                 .action(clap::ArgAction::SetTrue),
         );
 
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "windows",
-        all(target_os = "macos", feature = "macos-sandbox")
-    ))]
+    #[cfg(feature = "kubernetes")]
+    let cmd = cmd.arg(
+        Arg::new("kubernetes")
+            .long("kubernetes")
+            .value_name("MODE")
+            .help(
+                "Kubernetes pod/container attribution: \"auto\" (enable only when running inside a pod), \"on\" (always), or \"off\"",
+            )
+            .value_parser(["auto", "on", "off"])
+            .default_value("auto")
+            .required(false),
+    );
+
+    // Sandbox flags exist on every platform: rustnet-sandbox has a backend
+    // for each (Linux Landlock/caps, macOS Seatbelt, Windows restricted
+    // token/job object, and the uid-drop-only FreeBSD backend).
     let cmd = cmd
         .arg(
             Arg::new("no-sandbox")
                 .long("no-sandbox")
-                .help("Disable sandboxing")
+                .help("Disable sandboxing (on Linux, PR_SET_NO_NEW_PRIVS is still set)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -158,5 +197,67 @@ pub fn build_cli() -> Command {
                 .conflicts_with("no-sandbox"),
         );
 
+    // Which fallback attribution loses cross-user visibility after the drop
+    // differs per platform; only the help text changes.
+    #[cfg(target_os = "linux")]
+    const NO_UID_DROP_HELP: &str = "Keep running as root instead of dropping to SUDO_UID/SUDO_GID (or nobody) \
+         after initialization. Keeping root lets the procfs fallback attribute \
+         other users' processes when eBPF is unavailable";
+    #[cfg(target_os = "macos")]
+    const NO_UID_DROP_HELP: &str = "Keep running as root instead of dropping to SUDO_UID/SUDO_GID (or nobody) \
+         after initialization. Keeping root lets the lsof fallback attribute other \
+         users' processes when PKTAP is unavailable";
+    #[cfg(target_os = "freebsd")]
+    const NO_UID_DROP_HELP: &str = "Keep running as root instead of dropping to SUDO_UID/SUDO_GID (or nobody) \
+         after initialization. Keeping root lets sockstat attribute other users' \
+         processes";
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    let cmd = cmd.arg(
+        Arg::new("no-uid-drop")
+            .long("no-uid-drop")
+            .help(NO_UID_DROP_HELP)
+            .action(clap::ArgAction::SetTrue),
+    );
+
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_interval_defaults_to_500ms() {
+        let matches = build_cli()
+            .try_get_matches_from(["rustnet"])
+            .expect("default CLI arguments should parse");
+
+        assert_eq!(matches.get_one::<u64>("refresh-interval"), Some(&500));
+    }
+
+    #[test]
+    fn theme_has_no_default_and_accepts_all_presets() {
+        // No default: an absent --theme must defer to the config file.
+        let matches = build_cli()
+            .try_get_matches_from(["rustnet"])
+            .expect("no --theme should parse");
+        assert_eq!(matches.get_one::<String>("theme"), None);
+
+        for name in THEME_PRESETS {
+            let matches = build_cli()
+                .try_get_matches_from(["rustnet", "--theme", name])
+                .unwrap_or_else(|e| panic!("--theme {name} should parse: {e}"));
+            assert_eq!(
+                matches.get_one::<String>("theme").map(String::as_str),
+                Some(name)
+            );
+        }
+
+        assert!(
+            build_cli()
+                .try_get_matches_from(["rustnet", "--theme", "bogus"])
+                .is_err()
+        );
+    }
 }

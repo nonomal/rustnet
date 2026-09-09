@@ -1,42 +1,38 @@
-//! Filter input line shown above the status bar whenever the user
-//! has either entered filter mode or has a persistent filter active.
+//! Filter input line shown above the status bar while the user is typing
+//! a filter. A single borderless row: accent " / " prompt, the query with
+//! its cursor, and a muted right-side hint.
+//!
+//! It is an editing surface, not a status readout: once a query is
+//! confirmed the row is gone, and the Connections title chip plus the tab
+//! bar's activity dot carry the filter state instead.
 
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::Paragraph,
 };
 
-use crate::ui::{UIState, panel_block, theme};
+use crate::ui::{UiState, theme};
 
-pub(in crate::ui) fn draw_filter_input(f: &mut Frame, ui_state: &UIState, area: Rect) {
-    let title = if ui_state.filter_mode {
-        "Filter (↑↓/jk to navigate, Enter to confirm, Esc to cancel)"
-    } else {
-        "Active Filter (Press Esc to clear)"
-    };
+/// Height of the filter line in rows.
+pub(crate) const FILTER_INPUT_HEIGHT: u16 = 1;
 
-    let input_text = if ui_state.filter_mode {
-        // Show cursor when in filter mode
-        let mut display_query = ui_state.filter_query.clone();
-        if ui_state.filter_cursor_position <= display_query.len() {
-            display_query.insert(ui_state.filter_cursor_position, '|');
-        }
-        display_query
-    } else {
-        ui_state.filter_query.clone()
-    };
+pub(in crate::ui) fn draw_filter_input(f: &mut Frame, ui_state: &UiState, area: Rect) {
+    let mut query = ui_state.filter_query.clone();
+    if ui_state.filter_cursor_position <= query.len() {
+        query.insert(ui_state.filter_cursor_position, '|');
+    }
+    let hint = "↑↓ navigate · Enter confirm · Esc cancel ";
 
-    let style = if ui_state.filter_mode {
-        theme::fg(theme::warn())
-    } else {
-        theme::fg(theme::ok())
-    };
+    let line = Line::from(vec![
+        Span::styled(" / ", theme::bold_fg(theme::accent())),
+        Span::raw(query),
+    ]);
+    let hint_line = Line::from(Span::styled(hint, theme::fg(theme::muted()))).right_aligned();
 
-    let filter_input = Paragraph::new(input_text)
-        .block(panel_block(title))
-        .style(style)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(filter_input, area);
+    // Hint first, query second: when the terminal is too narrow for both,
+    // the query (rendered later) wins the overlap.
+    f.render_widget(Paragraph::new(hint_line), area);
+    f.render_widget(Paragraph::new(line), area);
 }

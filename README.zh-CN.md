@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> | <strong>简体中文</strong>
+  <a href="README.md">English</a> | <strong>简体中文</strong> | <a href="README.ja.md">日本語</a>
 </p>
 
 <p align="center">
@@ -28,13 +28,16 @@
 
 ## 功能特性
 
-- **进程级归属识别**：每一条 TCP、UDP、QUIC 连接都能追溯到所属进程。Linux 使用 eBPF，macOS 使用 PKTAP，Windows 与 FreeBSD 则走原生 API。Wireshark 与 tcpdump 做不到这一点；`netstat` / `ss` 也无法展示实时状态。
-- **深度包检测**：无需外部解析器即可识别 HTTP、带 SNI 的 HTTPS/TLS、DNS、SSH、FTP、QUIC、MQTT、BitTorrent、STUN、NTP、mDNS、LLMNR、DHCP、SNMP、SSDP 及 NetBIOS。
+- **进程级归属识别**：每一条 TCP、UDP、QUIC 连接都能追溯到所属进程。Linux 使用 eBPF，macOS 使用 PKTAP，Windows 使用 ETW 并在不可用时自动回退到 IP Helper，FreeBSD 则走原生 API。详情会显示 PID、可执行文件、用户/组名称、匹配可信度，以及每个平台都提供的父进程链（有层级上限）。Wireshark 与 tcpdump 做不到这一点；`netstat` / `ss` 也无法展示实时状态。
+- **深度包检测**：无需外部解析器即可识别 HTTP、带 SNI 的 HTTPS/TLS、DNS、SSH、FTP、QUIC、MQTT、BitTorrent、WireGuard、OpenVPN、STUN、NTP、mDNS、LLMNR、DHCP、SNMP、SSDP 及 NetBIOS。
+- **带注释的 PCAPNG 导出**：`--pcapng-export` 可写出能直接用 Wireshark 打开的捕获文件，并将进程、PID、方向、DPI/SNI 和 GeoIP 作为逐包注释嵌入。每个数据包都会直接标明所属进程，无需后处理。也可使用经典的 `--pcap-export` 配合 JSONL sidecar 进行离线关联。
 - **安全沙箱**：Linux 5.13+ 使用 Landlock，macOS 使用 Seatbelt，Windows 通过 token 降权 + job-object 阻止子进程创建。libpcap 初始化完成后立即丢弃特权。详见 [SECURITY.zh-CN.md](SECURITY.zh-CN.md)。
-- **TCP 网络分析**：实时统计重传、乱序包、快重传，既有逐连接视图也有汇总视图。
-- **智能连接生命周期**：按协议设置超时，以白 → 黄 → 红的颜色指示过期程度。按 `t` 可保留历史（已关闭）连接以便事后追溯。
+- **网络分析**：实时统计 TCP、QUIC 握手、DNS 响应及 ICMP 回显的往返时延，并检测 TCP 重传、乱序包和快重传。概览表格通过按协议显示的健康徽标，呈现 TCP 问题、明确可见的 QUIC Retry/版本协商事件，以及事务型 UDP 的重试/超时，并按严重程度排序。
+- **智能连接生命周期**：按协议设置超时，空闲连接行会显示由黄变红的左侧条纹和移除倒计时，并逐渐柔化为灰色。按 `t` 可保留历史（已关闭）连接以便事后追溯。
 - **Vim / fzf 风格过滤**：支持 `port:`、`src:`、`dst:`、`sni:`、`process:`、`state:`、`proto:`，以及 `/(?i)pattern/` 形式的正则。
 - **GeoIP 增强**：基于本地 MaxMind GeoLite2 数据库查询国家信息，不发起任何网络请求。
+- **局域网设备识别**：链路内设备和网关的 MAC 地址及厂商（来自内嵌的 IEEE OUI 数据库），从 ARP 流量中被动学习，并显示在详情页中。
+- **Kubernetes 归属识别**（可选 `kubernetes` feature）：将连接映射到所属 pod、namespace 和 container，并在详情面板、JSON/PCAPNG 导出以及 `pod:`、`ns:`、`container:` 过滤器中显示。官方 Docker 镜像已启用该功能；在集群上可使用 [kubectl-rustnet](https://github.com/domcyrus/kubectl-rustnet) 插件以临时调试 pod 运行。详见 [USAGE.zh-CN.md](USAGE.zh-CN.md#--kubernetes-mode-optional-feature)。
 - **跨平台**：Linux、macOS、Windows、FreeBSD。
 
 ## 为什么选 RustNet？
@@ -45,29 +48,24 @@ RustNet 填补了简单连接工具(`netstat`、`ss`)与数据包分析器(`Wire
 - **以连接为中心的视图**：逐连接实时追踪状态、带宽与协议。
 - **SSH 友好**：TUI 可直接在 SSH 会话中运行，远端服务器上发生了什么一眼可见，不必转发 X11 或抓包再回传。
 
-RustNet 与抓包工具是互补关系。用 RustNet 看清*谁在发起连接*；若要深入取证，可用 `--pcap-export` 抓取附带进程信息的数据包，再借 `scripts/pcap_enrich.py` 富化后，在 Wireshark 中结合完整的 PID 与进程上下文分析。参见 [USAGE.zh-CN.md 的 PCAP 导出章节](USAGE.zh-CN.md#pcap-export) 与 [ARCHITECTURE.zh-CN.md 的同类工具对比章节](ARCHITECTURE.zh-CN.md#comparison-with-similar-tools)。
+RustNet 与抓包工具是互补关系。用 RustNet 看清*谁在发起连接*；若要直接在 Wireshark 中查看，可用 `--pcapng-export` 写出带 RustNet 数据包注释的 PCAPNG；若更重视清理阶段的元数据完整性，可用 `--pcap-export` 加 JSONL sidecar，再借 `scripts/pcap_enrich.py` 富化。参见 [USAGE.zh-CN.md 的 PCAP 导出章节](USAGE.zh-CN.md#pcap-export) 与 [ARCHITECTURE.zh-CN.md 的同类工具对比章节](ARCHITECTURE.zh-CN.md#comparison-with-similar-tools)。
 
 基于 ratatui、libpcap、eBPF(libbpf-rs)、DashMap、crossbeam、ring、MaxMind GeoLite2 与 Landlock 构建。完整依赖清单见 [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md#dependencies)。
 
 <details>
 <summary><b>基于 eBPF 的增强型进程识别(Linux 默认)</b></summary>
 
-RustNet 在 Linux 上默认使用内核 eBPF 程序进行进程识别，从而获得更高的性能与更低的开销。但这种方式也有一些重要的限制需要了解：
+RustNet 在 Linux 上默认使用内核 eBPF 程序进行进程识别，从而获得更高的性能与更低的开销。
 
-**进程名长度限制：**
-- eBPF 使用内核的 `comm` 字段，该字段最多只有 16 个字符
-- 显示的是任务 / 线程的命令名，而非完整的可执行路径
-- 多线程应用往往展示线程名而非主进程名
-
-**真实场景示例：**
-- **Firefox**：可能显示为 "Socket Thread"、"Web Content"、"Isolated Web Co" 或 "MainThread"
-- **Chrome**：可能显示为 "ThreadPoolForeg"、"Chrome_IOThread"、"BrokerProcess" 或 "SandboxHelper"
-- **Electron 应用**：经常显示为 "electron"、"node" 或内部线程名
-- **系统进程**：展示截断后的名字，如 "systemd-resolve" → "systemd-resolve"
+**进程名：**
+- eBPF 记录的是进程组组长的 TGID 和 `comm` 名称（内核字段，最多 16 个字符），而非当前线程的名称，因此多线程应用显示的是主进程名，而不是 "Socket Thread" 之类的线程名
+- RustNet 随后会通过 `/proc/<tgid>/comm` 重新解析当前名称，并借助可执行文件名恢复被 `comm` 截断的名称（例如 "chromium-browse" 会恢复为 "chromium-browser"），同时解析完整可执行路径并显示在详情视图中
+- 在该富化流程运行前就已退出的短命进程，仍保留 eBPF 记录的 16 字符名称
 
 **回退行为：**
+- 在 Linux 5.11 及更高版本上，一次性的 BPF task-file 迭代器会清点 RustNet 启动前已经打开的 socket；使用文件 capabilities 运行时，也能识别 root 和其他用户拥有的 socket
 - 当 eBPF 加载失败或权限不足时，RustNet 会自动回退到基于 procfs 的标准进程识别方式
-- 标准模式可以拿到完整进程名，但 CPU 开销更高
+- 旧版内核和纯 procfs 构建通过 procfs 扫描解析进程名，CPU 开销更高，并且只能检查当前 RustNet 用户可见的 socket 所有者
 - eBPF 默认启用，无需任何特殊编译参数
 
 如需关闭 eBPF、仅使用 procfs 模式，请这样构建：
@@ -80,12 +78,15 @@ cargo build --release --no-default-features
 </details>
 
 <details>
-<summary><b>网络接口统计监控</b></summary>
+<summary><b>进程活动与主机监控</b></summary>
 
-RustNet 在所有支持的平台上提供实时的网络接口统计：
+RustNet 将进程级流量计量与实时网络接口统计整合在一起：
 
 - **概览标签页**：展示当前活跃的接口，包含速率、错误数与丢包数
-- **接口标签页**(按 `3`)：以详细表格呈现各接口的完整指标
+- **活动标签页**(按 `3`)：按出站 (TX) 或入站 (RX) 查看进程排名，包括保留流量与滚动流量、速率、占比、连接数和目的地
+- **安全工作流**：按出站流量排序，找出异常上传进程，然后检查其流量最大的远端对端；即使连接关闭，仍可查看保留流量
+- **主机标签页**(按 `5`)：显示 TCP LISTEN 套接字、UDP BOUND 端点、TCP 状态汇总、观测 RTT 和所属进程
+- **接口详情**(在主机标签页按 `i`)：显示各接口完整指标表格
 - **跨平台**：Linux(sysfs)、macOS / FreeBSD(getifaddrs)、Windows(GetIfTable2 API)
 - **智能过滤**：Windows 上自动剔除虚拟 / 过滤类适配器
 
@@ -110,7 +111,7 @@ RustNet 在所有支持的平台上提供实时的网络接口统计：
   </tr>
   <tr>
     <td align="center"><strong>图表</strong><br>流量曲线、应用分布、Top 进程<br><img src="./assets/screenshots/graph.png" width="400"></td>
-    <td align="center"><strong>接口</strong><br>各接口 RX / TX 历史曲线、错误与丢包<br><img src="./assets/screenshots/interfaces.png" width="400"></td>
+    <td align="center"><strong>活动</strong><br>进程出站/入站、60 秒覆盖率、归属信息与远端对端<br><img src="./assets/screenshots/interfaces.png" width="400"></td>
   </tr>
 </table>
 
@@ -123,9 +124,10 @@ RustNet 在所有支持的平台上提供实时的网络接口统计：
 brew install rustnet
 ```
 
-**Ubuntu(25.10+):**
+**Ubuntu(22.04 LTS+)/ Linux Mint 21+ / Pop!_OS 22.04+:**
 ```bash
 sudo add-apt-repository ppa:domcyrus/rustnet
+# Pop!_OS 上使用：sudo apt-manage add ppa:domcyrus/rustnet
 sudo apt update && sudo apt install rustnet
 ```
 
@@ -161,7 +163,7 @@ cargo install rustnet-monitor
 **Windows(Chocolatey):**
 ```powershell
 # 需在管理员权限的 PowerShell 中执行
-# 需要先安装 Npcap(https://npcap.com)，并启用 "WinPcap API-compatible Mode"
+# 需要先安装 Npcap(https://npcap.com)；支持安装程序的默认设置
 choco install rustnet
 ```
 
@@ -188,7 +190,11 @@ rustnet -i eth0              # 指定网络接口
 rustnet --show-localhost     # 显示 localhost 上的连接
 rustnet --no-resolve-dns     # 关闭反向 DNS 解析(默认开启)
 rustnet -r 500               # 设置刷新间隔(毫秒)
+rustnet --theme tokyo-night  # 主题：muted(默认)、vivid、catppuccin-mocha、tokyo-night、gruvbox、nord
+rustnet --pcapng-export capture.pcapng  # 导出带注释的 PCAPNG
 ```
+
+主题及各颜色的覆盖也可在 `~/.config/rustnet/config.toml` 中设置；`--theme` 优先。配置格式见 [USAGE.zh-CN.md](USAGE.zh-CN.md#--theme-preset)。
 
 权限配置详情见 [INSTALL.zh-CN.md](INSTALL.zh-CN.md)，完整参数说明见 [USAGE.zh-CN.md](USAGE.zh-CN.md)。
 
@@ -203,23 +209,28 @@ rustnet -r 500               # 设置刷新间隔(毫秒)
 | `x` | 清空所有连接(连按两次确认) |
 | `Tab` 或 `]` | 下一个标签页 |
 | `Shift+Tab` 或 `[` | 上一个标签页 |
-| `1`–`5` | 直接跳转到 Overview / Details / Interfaces / Graph / Help |
+| `1`–`5` | 直接跳转到 Overview / Details / Activity / Graph / Host |
 | `↑/k` `↓/j` | 上下移动 |
 | `g` `G` | 跳到第一条 / 最后一条连接 |
 | `Enter` | 查看连接详情 |
 | `Esc` | 返回或清除过滤器 |
 | `c` | 复制远端地址 |
 | `p` | 在服务名与端口之间切换 |
-| `d` | 在主机名与 IP 之间切换 |
+| `d` | 在概览中切换主机名/IP，或在活动标签页切换出站/入站 |
 | `s` `S` | 切换排序列 / 切换排序方向 |
 | `a` | 切换按进程分组 |
 | `Space` | 展开 / 折叠进程分组 |
-| `←/→` 或 `h/l` | 折叠 / 展开当前分组 |
+| `←` / `→` 或 `l` | 折叠 / 展开当前分组 |
 | `PageUp/PageDown` 或 `Ctrl+B/F` | 翻页 |
 | `t` | 切换是否显示历史（已关闭）连接 |
+| `i` | 在概览中切换 System 信息，或在主机标签页打开接口详情 |
 | `r` | 重置视图(分组、排序、过滤) |
 | `/` | 进入过滤模式 |
-| `h` | 切换帮助 |
+| `h` | 切换当前标签页的上下文帮助浮层 |
+
+在 Overview 中，底部状态栏会高亮当前启用的进程分组和历史连接模式。
+处于分组模式时，状态栏还会针对所选进程组显示 `space expand` 或
+`space collapse`。
 
 完整键位说明与导航技巧见 [USAGE.zh-CN.md](USAGE.zh-CN.md)。
 
@@ -235,9 +246,9 @@ rustnet -r 500               # 设置刷新间隔(毫秒)
 ```
 
 **排序：**
-- 按 `s` 在可排序的列之间循环切换(协议、地址、状态、服务、带宽、进程)
+- 按 `s` 在可排序的列之间循环切换(进程、地址、服务、应用、状态、带宽)
 - 按 `S`(Shift+s)切换升序 / 降序
-- 想抓出带宽大户：连续按 `s` 直到显示 "Down/Up ↓"(按上下行合计速度排序)
+- 想抓出带宽大户：连续按 `s` 直到显示 "Bandwidth Total ↓"(按上下行合计速度排序)
 
 完整的过滤语法与排序说明见 [USAGE.zh-CN.md](USAGE.zh-CN.md)。
 
@@ -273,22 +284,22 @@ rustnet -r 500               # 设置刷新间隔(毫秒)
 <details>
 <summary><b>连接生命周期与可视化指示</b></summary>
 
-RustNet 在移除连接前会先用智能超时机制与颜色给出预警：
+RustNet 在移除连接前会先通过智能超时机制与视觉提示给出预警：
 
-**过期程度的颜色指示：**
-- **白色**：活跃(< 75% 的超时时间)
-- **黄色**：开始过期(75% – 90% 的超时时间)
-- **红色**：即将过期(> 90% 的超时时间)
+**过期程度的视觉指示：**
+- **全彩**：活跃(< 50% 的超时时间)
+- **倒计时**：空闲(50% – 100% 的超时时间)，行左侧的 `▎` 条纹和带宽列中的剩余时间随移除临近由黄经橙变红，标识列逐渐柔化为灰色
+- **灰色**：历史连接，已关闭并归档，以暗淡的行显示，State 列标为 `closed`(按 `t` 显示)
 
 **按协议设定的超时：**
 - **HTTP / HTTPS**：10 分钟(支持 keep-alive)
 - **SSH**：30 分钟(适配长会话)
-- **TCP 活跃**：10 分钟；**TCP 空闲**：5 分钟
+- **普通 TCP 已建立连接**：5 分钟
 - **QUIC 已连接**：3 分钟(若对端通过 transport 参数声明了 idle timeout，则以对端为准);`Initial` / `Handshaking` 阶段：60 秒
 - **DNS**：30 秒
-- **TCP CLOSED**：5 秒
+- **TCP CLOSED**：15 秒归档宽限期
 
-举例：一条 HTTP 连接会在第 7.5 分钟变黄，第 9 分钟变红，第 10 分钟被移除。
+举例：一条 HTTP 连接从第 5 分钟起显示倒计时，第 10 分钟被移除，开启历史记录后则显示为灰色的历史连接行。
 
 完整超时说明见 [USAGE.zh-CN.md](USAGE.zh-CN.md)。
 

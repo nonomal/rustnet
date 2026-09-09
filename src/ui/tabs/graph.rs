@@ -1,15 +1,16 @@
-//! Graph tab — traffic chart, connections sparkline, network
+//! Graph tab: traffic chart, connections sparkline, network
 //! health, TCP counters, TCP state distribution, application
 //! protocol distribution, and top processes by bandwidth.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Axis, Cell, Chart, Dataset, GraphType, Paragraph, Row, Sparkline, Table},
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 use crate::app::App;
@@ -17,13 +18,78 @@ use crate::network::types::{
     AppProtocolDistribution, Connection, Protocol, ProtocolState, TcpState, TrafficHistory,
 };
 use crate::ui::{
-    ClickableRegions, Component, ComponentContext,
-    format::{format_rate, format_rate_compact},
-    panel_block, theme,
+    ClickableRegions, Component, ComponentContext, draw_placeholder,
+    format::format_rate,
+    section_header, section_title, theme,
+    widgets::{braille_graph, glow_bar},
 };
 
+const TCP_STATE_NAMES: [&str; 11] = [
+    "ESTAB",
+    "SYN_SENT",
+    "SYN_RECV",
+    "FIN_WAIT1",
+    "FIN_WAIT2",
+    "TIME_WAIT",
+    "CLOSE_WAIT",
+    "LAST_ACK",
+    "CLOSING",
+    "CLOSED",
+    "UNKNOWN",
+];
+
+/// Data used by the connection-derived graph panels. Building it once keeps
+/// the render cost to one pass over active connections.
+struct GraphAnalytics<'a> {
+    app_distribution: AppProtocolDistribution,
+    process_traffic: HashMap<&'a str, f64>,
+    tcp_state_counts: [usize; TCP_STATE_NAMES.len()],
+}
+
+impl<'a> GraphAnalytics<'a> {
+    fn from_connections(connections: &'a [Connection]) -> Self {
+        let mut analytics = Self {
+            app_distribution: AppProtocolDistribution::default(),
+            process_traffic: HashMap::new(),
+            tcp_state_counts: [0; TCP_STATE_NAMES.len()],
+        };
+
+        for conn in connections.iter().filter(|conn| !conn.is_historic) {
+            analytics.app_distribution.record_connection(conn);
+
+            let name = crate::ui::process_group_label(conn);
+            let traffic = conn.current_incoming_rate_bps + conn.current_outgoing_rate_bps;
+            *analytics.process_traffic.entry(name).or_insert(0.0) += traffic;
+
+            if conn.protocol == Protocol::Tcp
+                && let ProtocolState::Tcp(state) = &conn.protocol_state
+            {
+                analytics.tcp_state_counts[tcp_state_index(state)] += 1;
+            }
+        }
+
+        analytics
+    }
+}
+
+fn tcp_state_index(state: &TcpState) -> usize {
+    match state {
+        TcpState::Established => 0,
+        TcpState::SynSent => 1,
+        TcpState::SynReceived => 2,
+        TcpState::FinWait1 => 3,
+        TcpState::FinWait2 => 4,
+        TcpState::TimeWait => 5,
+        TcpState::CloseWait => 6,
+        TcpState::LastAck => 7,
+        TcpState::Closing => 8,
+        TcpState::Closed => 9,
+        TcpState::Unknown => 10,
+    }
+}
+
 /// Read-only graph tab. Aggregates traffic history, protocol mix,
-/// and TCP analytics every render — no per-tab state today.
+/// and TCP analytics every render; no per-tab state today.
 pub(in crate::ui) struct GraphTab;
 
 impl Component for GraphTab {
@@ -44,181 +110,262 @@ pub(in crate::ui) fn draw_graph_tab(
     connections: &[Connection],
     area: Rect,
 ) -> Result<()> {
-    // Filter out historic connections — graph should only show alive connections
-    let active_connections: Vec<Connection> = connections
-        .iter()
-        .filter(|c| !c.is_historic)
-        .cloned()
-        .collect();
-    let connections = &active_connections;
-
+    let analytics = GraphAnalytics::from_connections(connections);
     let traffic_history = app.get_traffic_history();
 
-    // Each panel gets its own Block::ALL border so the Graph tab matches the
-    // style of the connections table and the Details panes. No outer frame
-    // and no custom separator characters — ratatui's box-drawing renders
-    // cleanly without needing manual junctions.
+    // Each panel is a borderless section_header region; layout spacing
+    // provides the breathing room between them. The health
+    // and distribution rows hold a handful of lines each, so they get
+    // fixed heights and the wave panels absorb the rest; percentage
+    // sizing left a large hole between sections on tall terminals.
+    //
+    // The three sections plus spacing need 32 rows. Smaller terminals
+    // (a stock 80x24 leaves ~20 content rows) drop the fixed-height rows
+    // from the bottom up instead of rendering all three squeezed beyond
+    // recognition: first the distribution row, then the health row, so
+    // the waves always keep their minimum height.
+    const WAVE_MIN_ROWS: u16 = 8;
+    const HEALTH_ROWS: u16 = 10;
+    const DISTRIBUTION_ROWS: u16 = 12;
+    let show_distribution = area.height >= WAVE_MIN_ROWS + 1 + HEALTH_ROWS + 1 + DISTRIBUTION_ROWS;
+    let show_health = area.height >= WAVE_MIN_ROWS + 1 + HEALTH_ROWS;
+
+    let mut constraints = vec![Constraint::Min(WAVE_MIN_ROWS)]; // Traffic + connections waves
+    if show_health {
+        constraints.push(Constraint::Length(HEALTH_ROWS)); // Network health + TCP counters/states
+    }
+    if show_distribution {
+        constraints.push(Constraint::Length(DISTRIBUTION_ROWS)); // App distribution + top processes
+    }
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(35), // Traffic chart (RX/TX legend is built into the chart)
-            Constraint::Percentage(20), // Network health + TCP states
-            Constraint::Min(0),         // App distribution + top processes
-        ])
+        .spacing(1)
+        .constraints(constraints)
         .split(area);
 
     let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
+        .spacing(2)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(main_chunks[0]);
 
-    let health_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(35),
-            Constraint::Percentage(30),
-        ])
-        .split(main_chunks[1]);
-
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_chunks[2]);
-
     draw_traffic_chart(f, &traffic_history, top_chunks[0]);
-    draw_connections_sparkline(f, &traffic_history, top_chunks[1]);
-    draw_health_chart(f, &traffic_history, health_chunks[0]);
-    draw_tcp_counters(f, app, health_chunks[1]);
-    draw_tcp_states(f, connections, health_chunks[2]);
-    draw_app_distribution(f, connections, bottom_chunks[0]);
-    draw_top_processes(f, connections, bottom_chunks[1]);
+    draw_connection_lifecycle(f, &traffic_history, top_chunks[1]);
+
+    if show_health {
+        let health_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .spacing(2)
+            .constraints([
+                Constraint::Percentage(35),
+                Constraint::Percentage(35),
+                Constraint::Percentage(30),
+            ])
+            .split(main_chunks[1]);
+        draw_health_chart(f, &traffic_history, health_chunks[0]);
+        draw_tcp_counters(f, app, health_chunks[1]);
+        draw_tcp_states(f, &analytics.tcp_state_counts, health_chunks[2]);
+    }
+
+    if show_distribution {
+        let bottom_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .spacing(2)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(main_chunks[2]);
+        draw_app_distribution(f, &analytics.app_distribution, bottom_chunks[0]);
+        draw_top_processes(f, &analytics.process_traffic, bottom_chunks[1]);
+    }
 
     Ok(())
 }
 
-/// Draw the full traffic chart with RX/TX lines
+/// Draw the RX/TX traffic waves: two stacked braille area graphs with
+/// a vertical gradient (bright crest, saturated base), each header
+/// showing the current rate, a trend arrow, and the 60s peak.
 fn draw_traffic_chart(f: &mut Frame, history: &TrafficHistory, area: Rect) {
-    let block = panel_block(" Traffic Over Time (60s) ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = section_header(f, area, section_title(" Traffic Over Time (60s)"));
 
     if !history.has_enough_data() {
-        let placeholder = Paragraph::new("Collecting data...").style(theme::fg(theme::muted()));
-        f.render_widget(placeholder, inner);
+        draw_placeholder(f, inner, "Waiting for traffic data...");
         return;
     }
 
-    // Reserve a 1-cell legend strip at the bottom of the panel so RX/TX
-    // labels are always visible (ratatui's built-in chart legend gets hidden
-    // by `hidden_legend_constraints` when the chart area is small).
-    let layout = Layout::default()
+    // Blank row between the halves so the TX header doesn't sit
+    // directly on the RX wave's baseline.
+    let halves = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+        ])
         .split(inner);
-    let chart_area = layout[0];
-    let legend_area = layout[1];
 
-    let legend = Paragraph::new(Line::from(vec![
-        Span::styled("▬ RX (incoming) ↓", theme::fg(theme::rx())),
-        Span::raw("   "),
-        Span::styled("▬ TX (outgoing) ↑", theme::fg(theme::tx())),
-    ]));
-    f.render_widget(legend, legend_area);
+    let frac = history.scroll_fraction();
+    let window = history.capacity();
+    let rx = history.get_rx_sparkline_data(usize::MAX);
+    let tx = history.get_tx_sparkline_data(usize::MAX);
+    braille_graph::wave_panel(
+        f,
+        halves[0],
+        &rx,
+        "↓ RX",
+        braille_graph::WavePanelOptions::new(frac, window).with_max_val(history.rx_graph_ceiling()),
+        theme::rx_wave,
+    );
+    braille_graph::wave_panel(
+        f,
+        halves[2],
+        &tx,
+        "↑ TX",
+        braille_graph::WavePanelOptions::new(frac, window).with_max_val(history.tx_graph_ceiling()),
+        theme::tx_wave,
+    );
+}
 
-    let (rx_data, tx_data) = history.get_chart_data();
+fn draw_connection_lifecycle(f: &mut Frame, history: &TrafficHistory, area: Rect) {
+    let inner = section_header(f, area, section_title(" Connection Lifecycle"));
 
-    // Find max value for Y axis scaling
-    let max_rate = rx_data
-        .iter()
-        .chain(tx_data.iter())
-        .map(|(_, y)| *y)
-        .fold(0.0f64, |a, b| a.max(b))
-        .max(1024.0); // Minimum 1 KB/s scale
+    if !history.has_enough_data() {
+        draw_placeholder(f, inner, "Waiting for connection data...");
+        return;
+    }
 
-    let datasets = vec![
-        Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(theme::fg(theme::rx()))
-            .data(&rx_data),
-        Dataset::default()
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(theme::fg(theme::tx()))
-            .data(&tx_data),
+    if inner.height == 0 {
+        return;
+    }
+
+    let (active, retained) = history.latest_connection_counts();
+    let summary = Line::from(vec![
+        Span::styled(
+            format!("{active} active"),
+            theme::bold_fg(theme::accent_wave(0.8)),
+        ),
+        Span::styled("  ", theme::fg(theme::muted())),
+        Span::styled(format!("{retained} retained"), theme::fg(theme::muted())),
+    ]);
+    f.render_widget(
+        Paragraph::new(summary),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let waves_area = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+        ])
+        .split(waves_area);
+    let opened = history.get_opened_sparkline_data(usize::MAX);
+    let closed = history.get_closed_sparkline_data(usize::MAX);
+    draw_lifecycle_wave(
+        f,
+        halves[0],
+        &opened,
+        "OPENED",
+        LifecycleWaveOptions {
+            max_val: history.opened_graph_ceiling(),
+            frac: history.scroll_fraction(),
+            window: history.capacity(),
+            wave: theme::special_wave,
+        },
+    );
+    draw_lifecycle_wave(
+        f,
+        halves[2],
+        &closed,
+        "CLOSED",
+        LifecycleWaveOptions {
+            max_val: history.closed_graph_ceiling(),
+            frac: history.scroll_fraction(),
+            window: history.capacity(),
+            wave: theme::muted_wave,
+        },
+    );
+}
+
+struct LifecycleWaveOptions {
+    max_val: f64,
+    frac: f64,
+    window: usize,
+    wave: fn(f64) -> Color,
+}
+
+fn draw_lifecycle_wave(
+    f: &mut Frame,
+    area: Rect,
+    samples: &[u64],
+    label: &str,
+    options: LifecycleWaveOptions,
+) {
+    if area.height < 2 || samples.is_empty() {
+        return;
+    }
+
+    let current = samples.last().copied().unwrap_or(0);
+    let peak = samples.iter().copied().max().unwrap_or(0);
+    let speed_ratio = (current as f64 / options.max_val.max(1.0)).clamp(0.0, 1.0);
+    let left = vec![
+        Span::styled(format!("{label} "), theme::bold_fg((options.wave)(0.4))),
+        Span::styled(
+            format_lifecycle_rate(current),
+            theme::bold_fg((options.wave)(0.35 + 0.65 * speed_ratio)),
+        ),
+        Span::styled(
+            format!(" {}", braille_graph::trend_glyph(samples)),
+            theme::fg(theme::muted()),
+        ),
     ];
+    let right = Span::styled(
+        format!("peak {}", format_lifecycle_rate(peak)),
+        theme::fg(theme::muted()),
+    );
+    f.render_widget(
+        Paragraph::new(braille_graph::spread_line(left, right, area.width)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
 
-    let chart = Chart::new(datasets)
-        .x_axis(
-            Axis::default()
-                .title("Time")
-                .style(theme::fg(theme::muted()))
-                .bounds([-60.0, 0.0])
-                .labels(vec![
-                    Line::from("-60s"),
-                    Line::from("-30s"),
-                    Line::from("now"),
-                ]),
-        )
-        .y_axis(
-            Axis::default()
-                .title("Rate")
-                .style(theme::fg(theme::muted()))
-                .bounds([0.0, max_rate])
-                .labels(vec![
-                    Line::from("0"),
-                    Line::from(format_rate_compact(max_rate / 2.0)),
-                    Line::from(format_rate_compact(max_rate)),
-                ]),
-        );
-
-    f.render_widget(chart, chart_area);
+    let graph_area = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    let lines = braille_graph::render(
+        samples,
+        graph_area.width as usize,
+        graph_area.height as usize,
+        options.max_val.max(1.0),
+        options.frac,
+        options.window,
+        options.wave,
+    );
+    f.render_widget(Paragraph::new(lines), graph_area);
 }
 
-/// Draw connections count sparkline
-fn draw_connections_sparkline(f: &mut Frame, history: &TrafficHistory, area: Rect) {
-    let block = panel_block(" Connections ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if !history.has_enough_data() {
-        let placeholder = Paragraph::new("Collecting...").style(theme::fg(theme::muted()));
-        f.render_widget(placeholder, inner);
-        return;
+fn format_lifecycle_rate(rate_tenths: u64) -> String {
+    if rate_tenths.is_multiple_of(10) {
+        format!("{}/s", rate_tenths / 10)
+    } else {
+        format!("{}.{}/s", rate_tenths / 10, rate_tenths % 10)
     }
-
-    // Layout: sparkline + current count label
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-
-    let width = inner.width as usize;
-    let conn_data = history.get_connection_sparkline_data(width);
-
-    let sparkline = Sparkline::default()
-        .data(&conn_data)
-        .style(theme::fg(theme::accent()));
-    f.render_widget(sparkline, chunks[0]);
-
-    // Current connection count label (active connections only)
-    let current_count = conn_data.last().copied().unwrap_or(0);
-    let label = Paragraph::new(format!("{} active connections", current_count));
-    f.render_widget(label, chunks[1]);
 }
 
-/// Draw application protocol distribution
-fn draw_app_distribution(f: &mut Frame, connections: &[Connection], area: Rect) {
-    let block = panel_block(" Application Distribution ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+fn draw_app_distribution(f: &mut Frame, dist: &AppProtocolDistribution, area: Rect) {
+    let inner = section_header(f, area, section_title(" Application Distribution"));
 
-    let dist = AppProtocolDistribution::from_connections(connections);
     let percentages = dist.as_percentages();
 
-    // Filter out zero-count protocols and create bars.
-    // Layout per row: "{label:6} {bar} {pct:5.1}%" — 6 + 1 + bar + 1 + 6 = 14 + bar.
+    // Zero-count protocols are skipped.
+    // Layout per row: "{label:6} {bar} {pct:5.1}%", i.e. 6 + 1 + bar + 1 + 6 = 14 + bar.
     // Reserve those 14 cells plus 1 for right padding so bars don't touch
     // the panel edge.
     const LABEL_WIDTH: usize = 6;
@@ -235,26 +382,26 @@ fn draw_app_distribution(f: &mut Frame, connections: &[Connection], area: Rect) 
         }
 
         let filled = ((pct / 100.0) * bar_width as f64) as usize;
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
 
-        let color = match label {
-            "HTTPS" => theme::proto_https(),
-            "QUIC" => theme::proto_quic(),
-            "HTTP" => theme::proto_http(),
-            "DNS" => theme::proto_dns(),
-            "SSH" => theme::proto_ssh(),
-            _ => theme::proto_other(),
+        let (color, ramp): (Color, fn(f64) -> Color) = match label {
+            "HTTPS" => (theme::proto_https(), theme::ok_wave),
+            "QUIC" => (theme::proto_quic(), theme::accent_wave),
+            "HTTP" => (theme::proto_http(), theme::warn_wave),
+            "DNS" => (theme::proto_dns(), theme::special_wave),
+            "SSH" => (theme::proto_ssh(), theme::tx_wave),
+            _ => (theme::proto_other(), theme::muted_wave),
         };
 
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!("{:<width$}", label, width = LABEL_WIDTH),
                 theme::fg(color),
             ),
             Span::raw(" "),
-            Span::styled(bar, theme::fg(color)),
-            Span::raw(format!(" {:>5.1}%", pct)),
-        ]));
+        ];
+        spans.extend(glow_bar::from_filled(filled, bar_width, ramp));
+        spans.push(Span::raw(format!(" {:>5.1}%", pct)));
+        lines.push(Line::from(spans));
     }
 
     if lines.is_empty() {
@@ -268,43 +415,21 @@ fn draw_app_distribution(f: &mut Frame, connections: &[Connection], area: Rect) 
     f.render_widget(paragraph, inner);
 }
 
-/// Draw top processes by bandwidth
-fn draw_top_processes(f: &mut Frame, connections: &[Connection], area: Rect) {
-    use std::collections::HashMap;
+fn draw_top_processes(f: &mut Frame, process_traffic: &HashMap<&str, f64>, area: Rect) {
+    let inner = section_header(f, area, section_title(" Top Processes"));
 
-    let block = panel_block(" Top Processes ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Aggregate traffic by process
-    let mut process_traffic: HashMap<String, f64> = HashMap::new();
-    for conn in connections {
-        let name = conn
-            .process_name
-            .clone()
-            .unwrap_or_else(|| "Unknown".to_string());
-        let traffic = conn.current_incoming_rate_bps + conn.current_outgoing_rate_bps;
-        *process_traffic.entry(name).or_insert(0.0) += traffic;
-    }
-
-    // Sort by traffic descending, filter out processes with no traffic
-    let mut sorted: Vec<_> = process_traffic
-        .into_iter()
-        .filter(|(_, rate)| *rate > 0.0)
-        .collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_processes = select_top_processes(process_traffic, 5);
 
     // Create rows for top 5 processes. Process name absorbs whatever width is
     // left after the fixed-width Rate column, and Rate is right-aligned so the
     // numbers form a clean right edge.
-    let rows: Vec<Row> = sorted
+    let rows: Vec<Row> = top_processes
         .into_iter()
-        .take(5)
         .map(|(name, rate)| {
-            let display_name = if name.len() > 20 {
-                format!("{}...", &name[..17])
+            let display_name = if name.chars().count() > 20 {
+                format!("{}...", name.chars().take(17).collect::<String>())
             } else {
-                name
+                name.to_string()
             };
             Row::new(vec![
                 Cell::from(display_name),
@@ -315,8 +440,7 @@ fn draw_top_processes(f: &mut Frame, connections: &[Connection], area: Rect) {
         .collect();
 
     if rows.is_empty() {
-        let placeholder = Paragraph::new("No active processes").style(theme::fg(theme::muted()));
-        f.render_widget(placeholder, inner);
+        draw_placeholder(f, inner, "No active processes");
         return;
     }
 
@@ -331,26 +455,37 @@ fn draw_top_processes(f: &mut Frame, connections: &[Connection], area: Rect) {
     f.render_widget(table, inner);
 }
 
-/// Draw the network health gauges with RTT and packet loss bars
+fn select_top_processes<'a>(
+    process_traffic: &HashMap<&'a str, f64>,
+    limit: usize,
+) -> Vec<(&'a str, f64)> {
+    let mut processes: Vec<_> = process_traffic
+        .iter()
+        .filter_map(|(&name, &rate)| (rate > 0.0).then_some((name, rate)))
+        .collect();
+    let compare = |a: &(&str, f64), b: &(&str, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0));
+
+    if processes.len() > limit {
+        processes.select_nth_unstable_by(limit, compare);
+        processes.truncate(limit);
+    }
+    processes.sort_unstable_by(compare);
+    processes
+}
+
 fn draw_health_chart(f: &mut Frame, history: &TrafficHistory, area: Rect) {
-    let block = panel_block(" Network Health ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = section_header(f, area, section_title(" Observed Network Health"));
 
     if !history.has_enough_data() {
-        let placeholder = Paragraph::new("Collecting data...").style(theme::fg(theme::muted()));
-        f.render_widget(placeholder, inner);
+        draw_placeholder(f, inner, "Waiting for health data...");
         return;
     }
 
-    // Get current values from history
     let (loss_data, rtt_data) = history.get_health_chart_data();
 
-    // Get most recent values (last data point)
     let current_loss = loss_data.last().map(|(_, v)| *v).unwrap_or(0.0);
     let current_rtt = rtt_data.last().map(|(_, v)| *v);
 
-    // Calculate averages
     let avg_loss = if !loss_data.is_empty() {
         loss_data.iter().map(|(_, v)| v).sum::<f64>() / loss_data.len() as f64
     } else {
@@ -362,7 +497,6 @@ fn draw_health_chart(f: &mut Frame, history: &TrafficHistory, area: Rect) {
         None
     };
 
-    // Thresholds for gauges
     const RTT_MAX: f64 = 200.0; // 200ms max scale
     const LOSS_MAX: f64 = 10.0; // 10% max scale
 
@@ -370,26 +504,19 @@ fn draw_health_chart(f: &mut Frame, history: &TrafficHistory, area: Rect) {
     // Reserve 2 (lead) + 5 (label) + 1 (gap) + 9 (value) + 1 (pad) = 18.
     let bar_width = (inner.width as usize).saturating_sub(18).max(1);
 
-    // Build RTT gauge
     let rtt_line = if let Some(rtt) = current_rtt {
         let rtt_pct = (rtt / RTT_MAX).min(1.0);
         let filled = (rtt_pct * bar_width as f64) as usize;
-        let empty = bar_width.saturating_sub(filled);
 
-        let color = if rtt < 50.0 {
-            theme::ok()
-        } else if rtt < 150.0 {
-            theme::warn()
-        } else {
-            theme::err()
-        };
+        let (color, ramp) = theme::rtt_tier(rtt);
 
-        Line::from(vec![
-            Span::styled("  RTT  ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled("█".repeat(filled), theme::fg(color)),
-            Span::styled("░".repeat(empty), theme::fg(theme::muted())),
-            Span::styled(format!(" {:>6.1}ms", rtt), theme::fg(color)),
-        ])
+        let mut spans = vec![Span::styled(
+            "  RTT  ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(glow_bar::from_filled(filled, bar_width, ramp));
+        spans.push(Span::styled(format!(" {:>6.1}ms", rtt), theme::fg(color)));
+        Line::from(spans)
     } else {
         Line::from(vec![
             Span::styled("  RTT  ", Style::default().add_modifier(Modifier::BOLD)),
@@ -398,30 +525,26 @@ fn draw_health_chart(f: &mut Frame, history: &TrafficHistory, area: Rect) {
         ])
     };
 
-    // Build Loss gauge
     let loss_pct = (current_loss / LOSS_MAX).min(1.0);
     let filled = (loss_pct * bar_width as f64) as usize;
-    let empty = bar_width.saturating_sub(filled);
 
-    let loss_color = if current_loss < 1.0 {
-        theme::ok()
-    } else if current_loss < 5.0 {
-        theme::warn()
-    } else {
-        theme::err()
-    };
+    let (loss_color, loss_ramp) = theme::tier(current_loss, 1.0, 5.0);
 
-    let loss_line = Line::from(vec![
-        Span::styled("  Loss ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            "█".repeat(filled.max(if current_loss > 0.0 { 1 } else { 0 })),
-            theme::fg(loss_color),
-        ),
-        Span::styled("░".repeat(empty.min(bar_width)), theme::fg(theme::muted())),
-        Span::styled(format!(" {:>6.2}%", current_loss), theme::fg(loss_color)),
-    ]);
+    let mut loss_spans = vec![Span::styled(
+        "  Loss ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    loss_spans.extend(glow_bar::from_filled(
+        filled.max(if current_loss > 0.0 { 1 } else { 0 }),
+        bar_width,
+        loss_ramp,
+    ));
+    loss_spans.push(Span::styled(
+        format!(" {:>6.2}%", current_loss),
+        theme::fg(loss_color),
+    ));
+    let loss_line = Line::from(loss_spans);
 
-    // Build averages line
     let avg_line = Line::from(vec![
         Span::styled("  avg: ", theme::fg(theme::muted())),
         Span::styled(
@@ -438,7 +561,6 @@ fn draw_health_chart(f: &mut Frame, history: &TrafficHistory, area: Rect) {
     f.render_widget(paragraph, inner);
 }
 
-/// Draw TCP counters (retransmits, out of order, fast retransmits)
 fn draw_tcp_counters(f: &mut Frame, app: &App, area: Rect) {
     use std::sync::atomic::Ordering;
 
@@ -447,34 +569,13 @@ fn draw_tcp_counters(f: &mut Frame, app: &App, area: Rect) {
     let out_of_order = stats.total_tcp_out_of_order.load(Ordering::Relaxed);
     let fast_retransmits = stats.total_tcp_fast_retransmits.load(Ordering::Relaxed);
 
-    let block = panel_block(" TCP Counters ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = section_header(f, area, section_title(" TCP Counters"));
 
-    // Color based on counts (higher = more concerning)
-    let retrans_color = if retransmits == 0 {
-        theme::ok()
-    } else if retransmits < 100 {
-        theme::warn()
-    } else {
-        theme::err()
-    };
-
-    let ooo_color = if out_of_order == 0 {
-        theme::ok()
-    } else if out_of_order < 50 {
-        theme::warn()
-    } else {
-        theme::err()
-    };
-
-    let fast_color = if fast_retransmits == 0 {
-        theme::ok()
-    } else if fast_retransmits < 50 {
-        theme::warn()
-    } else {
-        theme::err()
-    };
+    // Color based on counts (higher = more concerning): zero is healthy,
+    // anything below the error threshold a warning.
+    let retrans_color = theme::tier_color(retransmits, 1, 100);
+    let ooo_color = theme::tier_color(out_of_order, 1, 50);
+    let fast_color = theme::tier_color(fast_retransmits, 1, 50);
 
     let lines = vec![
         Line::from(vec![
@@ -504,99 +605,136 @@ fn draw_tcp_counters(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, inner);
 }
 
-/// Draw TCP connection states breakdown
-fn draw_tcp_states(f: &mut Frame, connections: &[Connection], area: Rect) {
-    use std::collections::HashMap;
-
-    // Count TCP states
-    let mut state_counts: HashMap<&str, usize> = HashMap::new();
-    for conn in connections {
-        if conn.protocol == Protocol::Tcp
-            && let ProtocolState::Tcp(tcp_state) = &conn.protocol_state
-        {
-            let state_name = match tcp_state {
-                TcpState::Established => "ESTAB",
-                TcpState::SynSent => "SYN_SENT",
-                TcpState::SynReceived => "SYN_RECV",
-                TcpState::FinWait1 => "FIN_WAIT1",
-                TcpState::FinWait2 => "FIN_WAIT2",
-                TcpState::TimeWait => "TIME_WAIT",
-                TcpState::CloseWait => "CLOSE_WAIT",
-                TcpState::LastAck => "LAST_ACK",
-                TcpState::Closing => "CLOSING",
-                TcpState::Closed => "CLOSED",
-                TcpState::Unknown => "UNKNOWN",
-            };
-            *state_counts.entry(state_name).or_insert(0) += 1;
-        }
-    }
-
-    // Fixed order based on connection lifecycle (most important first)
-    const STATE_ORDER: &[&str] = &[
-        "ESTAB",
-        "SYN_SENT",
-        "SYN_RECV",
-        "FIN_WAIT1",
-        "FIN_WAIT2",
-        "TIME_WAIT",
-        "CLOSE_WAIT",
-        "LAST_ACK",
-        "CLOSING",
-        "CLOSED",
-        "LISTEN",
-        "UNKNOWN",
-    ];
-
-    // Build ordered list with only non-zero counts
-    let states: Vec<_> = STATE_ORDER
+fn draw_tcp_states(f: &mut Frame, state_counts: &[usize; TCP_STATE_NAMES.len()], area: Rect) {
+    let states: Vec<_> = TCP_STATE_NAMES
         .iter()
-        .filter_map(|&name| state_counts.get(name).map(|&count| (name, count)))
+        .zip(state_counts)
+        .filter_map(|(&name, &count)| (count > 0).then_some((name, count)))
         .collect();
 
-    let block = panel_block(" TCP States ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = section_header(f, area, section_title(" Observed TCP States"));
 
     if states.is_empty() {
-        let text = Paragraph::new("No TCP connections").style(theme::fg(theme::muted()));
-        f.render_widget(text, inner);
+        draw_placeholder(f, inner, "No TCP connections");
         return;
     }
 
-    // Find max count for bar scaling.
     // Layout per row: "{name:>10} {bar} {count:>4}" with 1 cell of right pad.
     // Reserve 10 (name) + 1 + 1 (count gap) + 4 (count) + 1 (right pad) = 17.
     let max_count = states.iter().map(|(_, c)| *c).max().unwrap_or(1);
     const RESERVED: usize = 17;
     let bar_width = (inner.width as usize).saturating_sub(RESERVED).max(1);
 
-    // Build lines for each state (limit to available height)
     let max_rows = inner.height as usize;
     let lines: Vec<Line> = states
         .iter()
         .take(max_rows)
         .map(|(name, count)| {
             let bar_len = (*count * bar_width).checked_div(max_count).unwrap_or(0);
-            let bar = "█".repeat(bar_len.max(1).min(bar_width));
 
-            // Color based on state health
-            let color = match *name {
-                "ESTAB" => theme::tcp_established(),
-                "SYN_SENT" | "SYN_RECV" => theme::tcp_opening(),
-                "TIME_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => theme::tcp_closing(),
-                "CLOSE_WAIT" | "LAST_ACK" | "CLOSING" => theme::tcp_waiting(),
-                "CLOSED" => theme::tcp_closed(),
-                _ => Color::Reset,
+            // Label color keeps the semantic state alias; the bar
+            // itself glows in the matching gradient family.
+            let (color, ramp): (Color, fn(f64) -> Color) = match *name {
+                "ESTAB" => (theme::tcp_established(), theme::ok_wave),
+                "SYN_SENT" | "SYN_RECV" => (theme::tcp_opening(), theme::warn_wave),
+                "TIME_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => {
+                    (theme::tcp_closing(), theme::muted_wave)
+                }
+                "CLOSE_WAIT" | "LAST_ACK" | "CLOSING" => (theme::tcp_waiting(), theme::muted_wave),
+                "CLOSED" => (theme::tcp_closed(), theme::muted_wave),
+                _ => (Color::Reset, theme::muted_wave),
             };
 
-            Line::from(vec![
-                Span::styled(format!("{:>10} ", name), theme::fg(color)),
-                Span::styled(bar, theme::fg(color)),
-                Span::raw(format!(" {:>4}", count)),
-            ])
+            let mut spans = vec![Span::styled(format!("{:>10} ", name), theme::fg(color))];
+            // No empty track here: rows are scaled to the max count,
+            // so a full-width track would just add noise.
+            let filled = bar_len.max(1).min(bar_width);
+            spans.extend(glow_bar::from_filled(filled, filled, ramp));
+            spans.push(Span::raw(format!(" {:>4}", count)));
+            Line::from(spans)
         })
         .collect();
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn test_connection(
+        port: u16,
+        process: &str,
+        rate: f64,
+        state: TcpState,
+        historic: bool,
+    ) -> Connection {
+        let mut connection = Connection::new(
+            Protocol::Tcp,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443),
+            ProtocolState::Tcp(state),
+        );
+        connection.process_name = Some(process.to_string());
+        connection.current_incoming_rate_bps = rate;
+        connection.is_historic = historic;
+        connection
+    }
+
+    #[test]
+    fn analytics_aggregate_active_connections_once() {
+        let connections = vec![
+            test_connection(1000, "alpha", 10.0, TcpState::Established, false),
+            test_connection(1001, "alpha", 20.0, TcpState::TimeWait, false),
+            test_connection(1002, "beta", 5.0, TcpState::Established, false),
+            test_connection(1003, "old", 100.0, TcpState::Closed, true),
+        ];
+
+        let analytics = GraphAnalytics::from_connections(&connections);
+
+        assert_eq!(analytics.app_distribution.total(), 3);
+        assert_eq!(analytics.process_traffic.get("alpha"), Some(&30.0));
+        assert_eq!(analytics.process_traffic.get("beta"), Some(&5.0));
+        assert!(!analytics.process_traffic.contains_key("old"));
+        assert_eq!(
+            analytics.tcp_state_counts[tcp_state_index(&TcpState::Established)],
+            2
+        );
+        assert_eq!(
+            analytics.tcp_state_counts[tcp_state_index(&TcpState::TimeWait)],
+            1
+        );
+        assert_eq!(
+            analytics.tcp_state_counts[tcp_state_index(&TcpState::Closed)],
+            0
+        );
+    }
+
+    #[test]
+    fn top_process_selection_only_sorts_the_requested_prefix() {
+        let traffic = HashMap::from([
+            ("one", 1.0),
+            ("two", 2.0),
+            ("three", 3.0),
+            ("four", 4.0),
+            ("five", 5.0),
+            ("six", 6.0),
+            ("seven", 7.0),
+            ("eight", 8.0),
+        ]);
+
+        let top = select_top_processes(&traffic, 3);
+
+        assert_eq!(top, vec![("eight", 8.0), ("seven", 7.0), ("six", 6.0)]);
+        assert!(select_top_processes(&traffic, 0).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_rates_keep_low_activity_visible() {
+        assert_eq!(format_lifecycle_rate(0), "0/s");
+        assert_eq!(format_lifecycle_rate(2), "0.2/s");
+        assert_eq!(format_lifecycle_rate(20), "2/s");
+    }
 }

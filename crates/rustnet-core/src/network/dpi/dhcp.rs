@@ -19,8 +19,7 @@ const DHCP_OPT_END: u8 = 255;
 /// Analyze a DHCP packet and extract key information.
 ///
 /// Returns `None` if the packet is too small or doesn't have the DHCP magic cookie.
-pub fn analyze_dhcp(payload: &[u8]) -> Option<DhcpInfo> {
-    // Early size check
+pub(super) fn analyze_dhcp(payload: &[u8]) -> Option<DhcpInfo> {
     if payload.len() < MIN_DHCP_SIZE {
         return None;
     }
@@ -31,7 +30,7 @@ pub fn analyze_dhcp(payload: &[u8]) -> Option<DhcpInfo> {
     }
 
     // Extract client MAC address from bytes 28-33 (chaddr field, first 6 bytes)
-    let client_mac = format_mac(&payload[28..34]);
+    let client_mac = crate::network::oui::format_mac(&payload[28..34]);
 
     // Parse DHCP options starting at byte 240
     let (message_type, hostname) = parse_dhcp_options(&payload[240..])?;
@@ -41,14 +40,6 @@ pub fn analyze_dhcp(payload: &[u8]) -> Option<DhcpInfo> {
         hostname,
         client_mac: Some(client_mac),
     })
-}
-
-/// Format a 6-byte MAC address as a string
-fn format_mac(bytes: &[u8]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-    )
 }
 
 /// Parse DHCP options and extract message type and hostname
@@ -126,13 +117,10 @@ mod tests {
     fn build_dhcp_packet(msg_type: u8, hostname: Option<&str>, mac: &[u8; 6]) -> Vec<u8> {
         let mut packet = vec![0u8; 240];
 
-        // Set client MAC at offset 28
         packet[28..34].copy_from_slice(mac);
 
-        // Set magic cookie at offset 236
         packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
 
-        // Add options
         // Option 53: DHCP Message Type
         packet.push(DHCP_OPT_MESSAGE_TYPE);
         packet.push(1); // length

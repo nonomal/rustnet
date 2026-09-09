@@ -1,5 +1,5 @@
 use crate::network::types::{BitTorrentInfo, BitTorrentType};
-use std::fmt::Write as _;
+use crate::network::util::hex_encode;
 
 /// BitTorrent protocol handshake prefix: length byte (19) + "BitTorrent protocol"
 const BT_HANDSHAKE_PREFIX: &[u8] = b"\x13BitTorrent protocol";
@@ -22,12 +22,12 @@ const MAX_DHT_METHOD_LEN: usize = 64;
 // --- TCP: Peer Handshake ---
 
 /// Check if the payload starts with a BitTorrent peer handshake.
-pub fn is_bittorrent_handshake(payload: &[u8]) -> bool {
+pub(super) fn is_bittorrent_handshake(payload: &[u8]) -> bool {
     payload.starts_with(BT_HANDSHAKE_PREFIX)
 }
 
 /// Analyze a BitTorrent TCP handshake payload and extract protocol details.
-pub fn analyze_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
+pub(super) fn analyze_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
     if !is_bittorrent_handshake(payload) {
         return None;
     }
@@ -44,7 +44,7 @@ pub fn analyze_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
 
     let info_hash = if payload.len() >= 48 {
         let hash_bytes = &payload[28..48];
-        Some(hex_encode(hash_bytes))
+        Some(hex_encode(hash_bytes, ""))
     } else {
         None
     };
@@ -71,7 +71,7 @@ pub fn analyze_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
 
 /// Analyze a UDP payload for BitTorrent DHT or uTP traffic.
 /// Tries DHT first (higher confidence), then uTP.
-pub fn analyze_udp_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
+pub(super) fn analyze_udp_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
     if let Some(info) = analyze_dht(payload) {
         return Some(info);
     }
@@ -81,8 +81,8 @@ pub fn analyze_udp_bittorrent(payload: &[u8]) -> Option<BitTorrentInfo> {
 /// Analyze a UDP payload for BitTorrent DHT (bencoded dictionary messages).
 ///
 /// DHT messages are bencoded dicts containing:
-/// - `y`: message type — `q` (query), `r` (response), `e` (error)
-/// - `q`: method name (for queries) — `ping`, `find_node`, `get_peers`, `announce_peer`
+/// - `y`: message type, `q` (query), `r` (response), `e` (error)
+/// - `q`: method name (for queries), `ping`, `find_node`, `get_peers`, `announce_peer`
 /// - `t`: transaction ID
 fn analyze_dht(payload: &[u8]) -> Option<BitTorrentInfo> {
     // Must start with 'd' (bencoded dict) and end with 'e'
@@ -100,7 +100,6 @@ fn analyze_dht(payload: &[u8]) -> Option<BitTorrentInfo> {
         return None;
     }
 
-    // Extract DHT method for queries
     let dht_method = if msg_type_char == b'q' {
         extract_dht_method(payload)
     } else if msg_type_char == b'r' {
@@ -190,7 +189,18 @@ fn analyze_utp(payload: &[u8]) -> Option<BitTorrentInfo> {
         return None;
     }
 
-    // Window size sanity check — 0 is valid for ST_RESET but otherwise should be non-zero
+    // Real uTP connection IDs are randomly generated, so 0 is effectively
+    // never seen, but bytes 2-3 == 0 is exactly what a WireGuard handshake
+    // initiation looks like here (type byte 0x01 followed by three reserved
+    // zero bytes). Since this check runs on every unmatched UDP packet,
+    // require a non-zero connection ID so WireGuard rekeys are not
+    // classified as BitTorrent.
+    let connection_id = u16::from_be_bytes([payload[2], payload[3]]);
+    if connection_id == 0 {
+        return None;
+    }
+
+    // Window size sanity check: 0 is valid for ST_RESET but otherwise should be non-zero
     let wnd_size = u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]);
     if pkt_type != 3 && wnd_size == 0 {
         // ST_SYN with zero window is also suspicious
@@ -270,16 +280,6 @@ fn format_version(bytes: &[u8]) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
-}
-
-/// Encode bytes as a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // write! to a String never fails.
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// Find the first occurrence of a subsequence in a byte slice.
@@ -443,12 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hex_encode() {
-        assert_eq!(hex_encode(&[0xDE, 0xAD, 0xBE, 0xEF]), "deadbeef");
-        assert_eq!(hex_encode(&[0x00, 0xFF]), "00ff");
-    }
-
-    #[test]
     fn test_format_version() {
         assert_eq!(format_version(b"4250"), "4.2.5.0");
         assert_eq!(format_version(b"3000"), "3.0.0.0");
@@ -517,9 +511,27 @@ mod tests {
         let mut payload = vec![0u8; UTP_HEADER_LEN];
         payload[0] = (pkt_type << 4) | (version & 0x0F);
         payload[1] = extension;
+        // connection_id at bytes 2-3: always random (non-zero) in real uTP
+        payload[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
         // wnd_size at bytes 12-15
         payload[12..16].copy_from_slice(&wnd_size.to_be_bytes());
         payload
+    }
+
+    #[test]
+    fn test_utp_rejects_wireguard_handshake_initiation() {
+        // WireGuard handshake initiation: message type 0x01, three reserved
+        // zero bytes, then a random sender index and ephemeral key. It
+        // passes every other uTP field check (version 1, type ST_DATA,
+        // extension 0, non-zero bytes at the wnd_size position), so the
+        // zero connection-id bytes are what must reject it.
+        let mut payload = vec![0u8; 148];
+        payload[0] = 0x01; // type=1 (handshake initiation), reserved bytes 1-3 zero
+        for (i, byte) in payload.iter_mut().enumerate().skip(4) {
+            *byte = (i * 31 % 251 + 1) as u8; // arbitrary non-zero key material
+        }
+        assert!(analyze_utp(&payload).is_none());
+        assert!(analyze_udp_bittorrent(&payload).is_none());
     }
 
     #[test]
@@ -616,29 +628,5 @@ mod tests {
     #[test]
     fn test_udp_returns_none_for_unknown() {
         assert!(analyze_udp_bittorrent(b"GET / HTTP/1.1\r\n").is_none());
-    }
-
-    #[test]
-    fn test_hex_encode_lowercase_20_byte_info_hash() {
-        // A representative 20-byte info-hash (the size BitTorrent always uses).
-        let info_hash: [u8; 20] = [
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x00, 0xff, 0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-        ];
-        assert_eq!(
-            hex_encode(&info_hash),
-            "123456789abcdef000ff0102030405060708090a"
-        );
-    }
-
-    #[test]
-    fn test_hex_encode_empty_slice() {
-        assert_eq!(hex_encode(&[]), "");
-    }
-
-    #[test]
-    fn test_hex_encode_pads_single_digit_bytes() {
-        // Locks the `{:02x}` padding contract — 0x00..=0x0f stay two chars.
-        assert_eq!(hex_encode(&[0x00, 0x0a, 0x0f, 0x10]), "000a0f10");
     }
 }

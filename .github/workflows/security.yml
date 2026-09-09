@@ -1,0 +1,23 @@
+name: Security audit
+
+# Scheduled dependency check against the committed Cargo.lock. PR/push CI
+# (rust.yml) already runs `cargo audit`, but new RustSec advisories and yanks
+# can affect an unchanged lockfile. This catches them without requiring a push.
+
+on:
+  schedule:
+    - cron: '37 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Check RustSec advisories
+        run: cargo audit

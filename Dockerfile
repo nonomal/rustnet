@@ -1,6 +1,6 @@
 # Multi-stage Docker build for RustNet
 # Base images are pinned by digest for reproducible, tamper-evident builds.
-FROM rust:1.96-slim@sha256:082a5849a6870672b5f7a5bf4eddc71723fce38756fd834a0d734a5306a310ab AS builder
+FROM rust:1.98-slim@sha256:bce1476d4be4d78b83705bc5f428b86d640eeeea33e9dadafbc037b5703a53bf AS builder
 
 # Install rustfmt component (required for eBPF compilation)
 RUN rustup component add rustfmt
@@ -33,12 +33,20 @@ COPY benches ./benches
 # bundled vmlinux headers compiled by its own build.rs.
 COPY crates ./crates
 
-# Build the application in release mode (eBPF is enabled by default on Linux)
-RUN cargo build --release
+# Build the application in release mode (eBPF is enabled by default on Linux).
+# Optional features can be added with --build-arg CARGO_FEATURES=kubernetes
+# (additive: default features stay on). The CI Kubernetes image variant passes
+# CARGO_FEATURES=kubernetes; the default image leaves it empty.
+ARG CARGO_FEATURES=""
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+        cargo build --release --features "$CARGO_FEATURES"; \
+    else \
+        cargo build --release; \
+    fi
 
 # Runtime stage - use trixie-slim to match GLIBC version from builder
 # Pinned by digest for a reproducible, tamper-evident base image.
-FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 # Install runtime dependencies
 # libcap2-bin provides setcap, used below to grant packet-capture capabilities
@@ -95,9 +103,9 @@ LABEL org.opencontainers.image.licenses="Apache License, Version 2.0"
 # bounding set and can't be granted to a non-root user via file capabilities.
 # Enable eBPF by running as root with the extra caps (modern kernels 5.8+):
 #   docker run --user root --cap-add=BPF --cap-add=PERFMON rustnet
-# Older kernels use CAP_SYS_ADMIN instead of BPF+PERFMON:
-#   docker run --user root --cap-add=SYS_ADMIN rustnet
-# Without those, rustnet falls back to /proc-based process detection.
+# Legacy kernels require broad CAP_SYS_ADMIN for eBPF. RustNet does not
+# recommend granting it by default; without eBPF caps, rustnet falls back to
+# /proc-based process detection.
 # CAP_NET_ADMIN is NOT required (read-only, non-promiscuous capture).
 USER rustnet
 ENTRYPOINT ["rustnet"]

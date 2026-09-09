@@ -1,5 +1,7 @@
 //! Vim/fzf-style connection filter: parses `port:`, `src:`, `dst:`,
-//! `sni:`, `process:`, `state:`, `proto:` keyword expressions (with
+//! `sni:`, `process:`, `state:`, `proto:`, (and `pod:`, `ns:`,
+//! `container:` when the `kubernetes` feature is enabled) keyword
+//! expressions (with
 //! optional `(?i)…` regex literals via `regex-lite`) and matches them
 //! against live `Connection` records.
 
@@ -8,8 +10,8 @@ use regex_lite::Regex;
 
 /// How to match a text field (case-insensitive for literals; regex handles its own flags)
 #[derive(Debug, Clone)]
-pub enum FilterValue {
-    /// Case-insensitive substring match (existing default)
+enum FilterValue {
+    /// Case-insensitive substring match (default)
     Literal(String),
     /// Pre-compiled regex (compiled with (?i) prefix for case-insensitive matching)
     Regex(Regex),
@@ -17,17 +19,17 @@ pub enum FilterValue {
 
 /// How to match a port number
 #[derive(Debug, Clone)]
-pub enum PortMatch {
-    /// Exact equality — default when the filter value is all digits
+enum PortMatch {
+    /// Exact equality, the default when the filter value is all digits
     Exact(u16),
-    /// Substring match — fallback for non-numeric, non-regex values
+    /// Substring match, the fallback for non-numeric, non-regex values
     Partial(String),
     /// Pre-compiled regex
     Regex(Regex),
 }
 
 #[derive(Debug, Clone)]
-pub enum FilterCriteria {
+enum FilterCriteria {
     /// Match any field containing this text
     General(FilterValue),
     /// Match port number (local or remote)
@@ -52,10 +54,19 @@ pub enum FilterCriteria {
     Application(FilterValue),
     /// Match connection state (e.g., ESTABLISHED, SYN_RECV)
     State(FilterValue),
+    /// Match Kubernetes pod name or UID
+    #[cfg(feature = "kubernetes")]
+    Pod(FilterValue),
+    /// Match Kubernetes pod namespace
+    #[cfg(feature = "kubernetes")]
+    Namespace(FilterValue),
+    /// Match Kubernetes container name or ID
+    #[cfg(feature = "kubernetes")]
+    Container(FilterValue),
 }
 
 pub struct ConnectionFilter {
-    pub criteria: Vec<FilterCriteria>,
+    criteria: Vec<FilterCriteria>,
 }
 
 /// Parse a filter value string into a `PortMatch`.
@@ -111,8 +122,16 @@ fn match_text(haystack: &str, fv: &FilterValue) -> bool {
     }
 }
 
+/// True when any of the present (`Some`) optional text fields matches the
+/// filter value; absent fields are skipped.
+fn any_text_matches<'a>(
+    fv: &FilterValue,
+    fields: impl IntoIterator<Item = Option<&'a str>>,
+) -> bool {
+    fields.into_iter().flatten().any(|s| match_text(s, fv))
+}
+
 impl ConnectionFilter {
-    /// Parse filter query string into filter criteria
     pub fn parse(query: &str) -> Self {
         let mut criteria = Vec::new();
 
@@ -120,7 +139,6 @@ impl ConnectionFilter {
             return Self { criteria };
         }
 
-        // Split by whitespace and process each part
         let parts: Vec<&str> = query.split_whitespace().collect();
 
         for part in parts {
@@ -160,6 +178,18 @@ impl ConnectionFilter {
                     "state" => {
                         criteria.push(FilterCriteria::State(parse_filter_value(&value)));
                     }
+                    #[cfg(feature = "kubernetes")]
+                    "pod" => {
+                        criteria.push(FilterCriteria::Pod(parse_filter_value(&value)));
+                    }
+                    #[cfg(feature = "kubernetes")]
+                    "ns" | "namespace" => {
+                        criteria.push(FilterCriteria::Namespace(parse_filter_value(&value)));
+                    }
+                    #[cfg(feature = "kubernetes")]
+                    "container" | "cont" => {
+                        criteria.push(FilterCriteria::Container(parse_filter_value(&value)));
+                    }
                     _ => {
                         // Unknown keyword, treat as general search
                         criteria.push(FilterCriteria::General(parse_filter_value(
@@ -168,7 +198,6 @@ impl ConnectionFilter {
                     }
                 }
             } else {
-                // General text search
                 criteria.push(FilterCriteria::General(parse_filter_value(
                     &part.to_lowercase(),
                 )));
@@ -178,13 +207,11 @@ impl ConnectionFilter {
         Self { criteria }
     }
 
-    /// Check if a connection matches all filter criteria
     pub fn matches(&self, connection: &Connection) -> bool {
         if self.criteria.is_empty() {
             return true;
         }
 
-        // All criteria must match (AND operation)
         self.criteria.iter().all(|criterion| match criterion {
             FilterCriteria::General(fv) => self.matches_general(connection, fv),
             FilterCriteria::Port(pm) => {
@@ -197,7 +224,7 @@ impl ConnectionFilter {
             FilterCriteria::DestinationIp(fv) => {
                 match_text(&connection.remote_addr.ip().to_string(), fv)
             }
-            FilterCriteria::Protocol(fv) => match_text(&connection.protocol.to_string(), fv),
+            FilterCriteria::Protocol(fv) => match_text(connection.protocol.as_str(), fv),
             FilterCriteria::Process(fv) => {
                 if let Some(ref process_name) = connection.process_name {
                     match_text(process_name, fv)
@@ -215,87 +242,75 @@ impl ConnectionFilter {
             FilterCriteria::Sni(fv) => self.matches_sni(connection, fv),
             FilterCriteria::Application(fv) => self.matches_application(connection, fv),
             FilterCriteria::State(fv) => match_text(&connection.state(), fv),
+            #[cfg(feature = "kubernetes")]
+            FilterCriteria::Pod(fv) => connection.k8s_info.as_ref().is_some_and(|k| {
+                k.pod_name.as_deref().is_some_and(|n| match_text(n, fv))
+                    || k.pod_uid.as_deref().is_some_and(|u| match_text(u, fv))
+            }),
+            #[cfg(feature = "kubernetes")]
+            FilterCriteria::Namespace(fv) => connection.k8s_info.as_ref().is_some_and(|k| {
+                k.pod_namespace
+                    .as_deref()
+                    .is_some_and(|ns| match_text(ns, fv))
+            }),
+            #[cfg(feature = "kubernetes")]
+            FilterCriteria::Container(fv) => connection.k8s_info.as_ref().is_some_and(|k| {
+                k.container_name
+                    .as_deref()
+                    .is_some_and(|n| match_text(n, fv))
+                    || k.container_id.as_deref().is_some_and(|c| match_text(c, fv))
+            }),
         })
     }
 
-    /// Check if connection matches general text search across all fields
+    /// General text search across basic connection info, process, service,
+    /// DPI details, the DNS-attributed hostname and ARP vendor names.
     fn matches_general(&self, connection: &Connection, fv: &FilterValue) -> bool {
-        // Check basic connection info
-        if match_text(&connection.protocol.to_string(), fv)
+        let (arp_sender_vendor, arp_target_vendor) = match connection.protocol_state {
+            ProtocolState::Arp(ref arp_info) => (
+                arp_info.sender_vendor.as_deref(),
+                arp_info.target_vendor.as_deref(),
+            ),
+            _ => (None, None),
+        };
+
+        match_text(connection.protocol.as_str(), fv)
             || match_text(&connection.local_addr.to_string(), fv)
             || match_text(&connection.remote_addr.to_string(), fv)
-        {
-            return true;
-        }
-
-        // Check process info
-        if let Some(ref process_name) = connection.process_name
-            && match_text(process_name, fv)
-        {
-            return true;
-        }
-
-        // Check service info
-        if let Some(ref service_name) = connection.service_name
-            && match_text(service_name, fv)
-        {
-            return true;
-        }
-
-        // Check DPI info
-        if let Some(ref dpi_info) = connection.dpi_info
-            && self.matches_dpi_general(&dpi_info.application, fv)
-        {
-            return true;
-        }
-
-        // Check ARP vendor names
-        if let ProtocolState::Arp(ref arp_info) = connection.protocol_state {
-            if let Some(ref vendor) = arp_info.sender_vendor
-                && match_text(vendor, fv)
-            {
-                return true;
-            }
-            if let Some(ref vendor) = arp_info.target_vendor
-                && match_text(vendor, fv)
-            {
-                return true;
-            }
-        }
-
-        false
+            || any_text_matches(
+                fv,
+                [
+                    connection.process_name.as_deref(),
+                    connection.service_name.as_deref(),
+                    connection
+                        .attributed_hostname
+                        .as_ref()
+                        .map(|att| att.name.as_str()),
+                    arp_sender_vendor,
+                    arp_target_vendor,
+                ],
+            )
+            || connection
+                .dpi_info
+                .as_ref()
+                .is_some_and(|dpi_info| self.matches_dpi_general(&dpi_info.application, fv))
     }
 
-    /// Check if SNI matches the filter value
+    /// SNI or DNS-attributed hostname match (DNS query names are not
+    /// considered; use the DNS-aware filters for those).
     fn matches_sni(&self, connection: &Connection, fv: &FilterValue) -> bool {
-        if let Some(ref dpi_info) = connection.dpi_info {
-            match &dpi_info.application {
-                ApplicationProtocol::Https(info) => {
-                    if let Some(ref tls_info) = info.tls_info
-                        && let Some(ref sni) = tls_info.sni
-                    {
-                        return match_text(sni, fv);
-                    }
-                }
-                ApplicationProtocol::Quic(info) => {
-                    if let Some(ref tls_info) = info.tls_info
-                        && let Some(ref sni) = tls_info.sni
-                    {
-                        return match_text(sni, fv);
-                    }
-                }
-                ApplicationProtocol::Http(info) => {
-                    if let Some(ref host) = info.host {
-                        return match_text(host, fv);
-                    }
-                }
-                _ => {}
-            }
+        if let Some(ref dpi_info) = connection.dpi_info
+            && let Some(hostname) = dpi_info.application.hostname()
+            && match_text(hostname, fv)
+        {
+            return true;
         }
-        false
+        connection
+            .attributed_hostname
+            .as_ref()
+            .is_some_and(|att| match_text(&att.name, fv))
     }
 
-    /// Check if application protocol matches the filter value
     fn matches_application(&self, connection: &Connection, fv: &FilterValue) -> bool {
         if let Some(ref dpi_info) = connection.dpi_info {
             match_text(&dpi_info.application.to_string(), fv)
@@ -304,220 +319,104 @@ impl ConnectionFilter {
         }
     }
 
-    /// Check if DPI info matches general search
     fn matches_dpi_general(&self, application: &ApplicationProtocol, fv: &FilterValue) -> bool {
-        // Check the application type display
         if match_text(&application.to_string(), fv) {
             return true;
         }
 
-        // Check specific protocol details
         match application {
-            ApplicationProtocol::Http(info) => {
-                if let Some(ref host) = info.host
-                    && match_text(host, fv)
-                {
-                    return true;
-                }
-                if let Some(ref path) = info.path
-                    && match_text(path, fv)
-                {
-                    return true;
-                }
-                if let Some(ref method) = info.method
-                    && match_text(method, fv)
-                {
-                    return true;
-                }
+            ApplicationProtocol::Http(info) => any_text_matches(
+                fv,
+                [
+                    info.host.as_deref(),
+                    info.path.as_deref(),
+                    info.method.as_deref(),
+                ],
+            ),
+            ApplicationProtocol::Https(_) | ApplicationProtocol::Quic(_) => {
+                application.tls_info().is_some_and(|tls_info| {
+                    any_text_matches(
+                        fv,
+                        std::iter::once(tls_info.sni.as_deref())
+                            .chain(tls_info.alpn.iter().map(|alpn| Some(alpn.as_str()))),
+                    )
+                })
             }
-            ApplicationProtocol::Https(info) => {
-                if let Some(ref tls_info) = info.tls_info {
-                    if let Some(ref sni) = tls_info.sni
-                        && match_text(sni, fv)
-                    {
-                        return true;
-                    }
-                    // Check ALPN protocols
-                    for alpn in &tls_info.alpn {
-                        if match_text(alpn, fv) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            ApplicationProtocol::Dns(info) => {
-                if let Some(ref query_name) = info.query_name
-                    && match_text(query_name, fv)
-                {
-                    return true;
-                }
-            }
-            ApplicationProtocol::Quic(info) => {
-                if let Some(ref tls_info) = info.tls_info {
-                    if let Some(ref sni) = tls_info.sni
-                        && match_text(sni, fv)
-                    {
-                        return true;
-                    }
-                    // Check ALPN protocols
-                    for alpn in &tls_info.alpn {
-                        if match_text(alpn, fv) {
-                            return true;
-                        }
-                    }
-                }
-            }
+            ApplicationProtocol::Dns(info) => any_text_matches(fv, [info.query_name.as_deref()]),
             ApplicationProtocol::Ssh(info) => {
-                if match_text("ssh", fv) {
-                    return true;
-                }
-
-                // Check software names
-                if let Some(ref software) = info.server_software
-                    && match_text(software, fv)
-                {
-                    return true;
-                }
-                if let Some(ref software) = info.client_software
-                    && match_text(software, fv)
-                {
-                    return true;
-                }
-
-                // Check connection state
                 let state_str = format!("{:?}", info.connection_state).to_lowercase();
-                if match_text(&state_str, fv) {
-                    return true;
-                }
-
-                // Check algorithms
-                for algo in &info.algorithms {
-                    if match_text(algo, fv) {
-                        return true;
-                    }
-                }
+                match_text("ssh", fv)
+                    || any_text_matches(
+                        fv,
+                        [
+                            info.server_software.as_deref(),
+                            info.client_software.as_deref(),
+                            Some(state_str.as_str()),
+                        ]
+                        .into_iter()
+                        .chain(info.algorithms.iter().map(|algo| Some(algo.as_str()))),
+                    )
             }
-            ApplicationProtocol::Ntp(_) => {
-                if match_text("ntp", fv) {
-                    return true;
-                }
-            }
+            ApplicationProtocol::Ntp(_) => match_text("ntp", fv),
             ApplicationProtocol::Ftp(info) => {
-                if match_text("ftp", fv) {
-                    return true;
-                }
-                if let Some(ref cmd) = info.command
-                    && match_text(cmd, fv)
-                {
-                    return true;
-                }
-                if let Some(ref user) = info.username
-                    && match_text(user, fv)
-                {
-                    return true;
-                }
-                if let Some(ref sw) = info.server_software
-                    && match_text(sw, fv)
-                {
-                    return true;
-                }
-                if let Some(ref sys) = info.system_type
-                    && match_text(sys, fv)
-                {
-                    return true;
-                }
-                if let Some(code) = info.response_code
-                    && match_text(&code.to_string(), fv)
-                {
-                    return true;
-                }
+                let response_code = info.response_code.map(|code| code.to_string());
+                match_text("ftp", fv)
+                    || any_text_matches(
+                        fv,
+                        [
+                            info.command.as_deref(),
+                            info.username.as_deref(),
+                            info.server_software.as_deref(),
+                            info.system_type.as_deref(),
+                            response_code.as_deref(),
+                        ],
+                    )
             }
-            ApplicationProtocol::Mdns(info) => {
-                if let Some(ref query_name) = info.query_name
-                    && match_text(query_name, fv)
-                {
-                    return true;
-                }
-            }
-            ApplicationProtocol::Llmnr(info) => {
-                if let Some(ref query_name) = info.query_name
-                    && match_text(query_name, fv)
-                {
-                    return true;
-                }
-            }
-            ApplicationProtocol::Dhcp(info) => {
-                if let Some(ref hostname) = info.hostname
-                    && match_text(hostname, fv)
-                {
-                    return true;
-                }
-            }
-            ApplicationProtocol::Snmp(info) => {
-                if let Some(ref community) = info.community
-                    && match_text(community, fv)
-                {
-                    return true;
-                }
-            }
-            ApplicationProtocol::Ssdp(info) => {
-                if let Some(ref service_type) = info.service_type
-                    && match_text(service_type, fv)
-                {
-                    return true;
-                }
-            }
-            ApplicationProtocol::NetBios(info) => {
-                if let Some(ref name) = info.name
-                    && match_text(name, fv)
-                {
-                    return true;
-                }
-            }
+            ApplicationProtocol::Mdns(info) => any_text_matches(fv, [info.query_name.as_deref()]),
+            ApplicationProtocol::Llmnr(info) => any_text_matches(fv, [info.query_name.as_deref()]),
+            ApplicationProtocol::Dhcp(info) => any_text_matches(fv, [info.hostname.as_deref()]),
+            ApplicationProtocol::Snmp(info) => any_text_matches(fv, [info.community.as_deref()]),
+            ApplicationProtocol::Ssdp(info) => any_text_matches(fv, [info.service_type.as_deref()]),
+            ApplicationProtocol::NetBios(info) => any_text_matches(fv, [info.name.as_deref()]),
             ApplicationProtocol::BitTorrent(info) => {
-                if match_text("bittorrent", fv) {
-                    return true;
-                }
-                if let Some(ref client) = info.client
-                    && match_text(client, fv)
-                {
-                    return true;
-                }
+                match_text("bittorrent", fv) || any_text_matches(fv, [info.client.as_deref()])
             }
             ApplicationProtocol::Stun(info) => {
-                if match_text("stun", fv) {
-                    return true;
-                }
-                if let Some(ref software) = info.software
-                    && match_text(software, fv)
-                {
-                    return true;
-                }
+                match_text("stun", fv) || any_text_matches(fv, [info.software.as_deref()])
             }
             ApplicationProtocol::Mqtt(info) => {
-                if match_text("mqtt", fv) {
-                    return true;
-                }
-                if let Some(ref client_id) = info.client_id
-                    && match_text(client_id, fv)
-                {
-                    return true;
-                }
-                if let Some(ref topic) = info.topic
-                    && match_text(topic, fv)
-                {
-                    return true;
-                }
+                match_text("mqtt", fv)
+                    || any_text_matches(fv, [info.client_id.as_deref(), info.topic.as_deref()])
+            }
+            ApplicationProtocol::WireGuard(info) => match_text(&info.packet_type.to_string(), fv),
+            ApplicationProtocol::OpenVpn(info) => {
+                match_text(&info.packet_type.to_string(), fv)
+                    || match_text(&info.key_id.to_string(), fv)
             }
         }
-
-        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::types::{Protocol, TcpState};
+
+    /// Connection fixture: TCP flows come up `Established`, UDP flows in the
+    /// plain `Udp` state. Tests needing another state override
+    /// `protocol_state` after construction.
+    fn conn(protocol: Protocol, local: &str, remote: &str) -> Connection {
+        let state = match protocol {
+            Protocol::Udp => ProtocolState::Udp,
+            _ => ProtocolState::Tcp(TcpState::Established),
+        };
+        Connection::new(
+            protocol,
+            local.parse().unwrap(),
+            remote.parse().unwrap(),
+            state,
+        )
+    }
 
     #[test]
     fn test_parse_general_filter() {
@@ -589,28 +488,10 @@ mod tests {
 
     #[test]
     fn test_port_exact_no_partial_match() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
         // port:22 should NOT match port 2223 or 5522
-        let conn_2223 = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 2223),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-            ProtocolState::Tcp(TcpState::Established),
-        );
-        let conn_5522 = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5522),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-            ProtocolState::Tcp(TcpState::Established),
-        );
-        let conn_22 = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 22),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-            ProtocolState::Tcp(TcpState::Established),
-        );
+        let conn_2223 = conn(Protocol::Tcp, "127.0.0.1:2223", "10.0.0.1:80");
+        let conn_5522 = conn(Protocol::Tcp, "127.0.0.1:5522", "10.0.0.1:80");
+        let conn_22 = conn(Protocol::Tcp, "127.0.0.1:22", "10.0.0.1:80");
 
         let filter = ConnectionFilter::parse("port:22");
         assert!(
@@ -626,16 +507,12 @@ mod tests {
 
     #[test]
     fn test_port_regex_partial_match() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
         // port:/22/ should match 22, 220, 2200, 5522
         let make_conn = |local_port: u16| {
-            Connection::new(
+            conn(
                 Protocol::Tcp,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), local_port),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-                ProtocolState::Tcp(TcpState::Established),
+                &format!("127.0.0.1:{local_port}"),
+                "10.0.0.1:80",
             )
         };
 
@@ -649,15 +526,7 @@ mod tests {
 
     #[test]
     fn test_state_filter_tcp_states() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let mut conn = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-            ProtocolState::Tcp(TcpState::Established),
-        );
+        let mut conn = conn(Protocol::Tcp, "127.0.0.1:12345", "10.0.0.1:80");
 
         let established_filter = ConnectionFilter::parse("state:established");
         assert!(established_filter.matches(&conn));
@@ -678,15 +547,7 @@ mod tests {
 
     #[test]
     fn test_state_filter_udp_states() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let conn = Connection::new(
-            Protocol::Udp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-            ProtocolState::Udp,
-        );
+        let conn = conn(Protocol::Udp, "127.0.0.1:12345", "8.8.8.8:53");
 
         let active_filter = ConnectionFilter::parse("state:udp_active");
         assert!(active_filter.matches(&conn));
@@ -697,15 +558,8 @@ mod tests {
 
     #[test]
     fn test_combined_state_and_port_filter() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let conn = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 443),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 54321),
-            ProtocolState::Tcp(TcpState::SynReceived),
-        );
+        let mut conn = conn(Protocol::Tcp, "0.0.0.0:443", "192.168.1.100:54321");
+        conn.protocol_state = ProtocolState::Tcp(TcpState::SynReceived);
 
         let combined_filter = ConnectionFilter::parse("sport:443 state:syn_recv");
         assert!(combined_filter.matches(&conn));
@@ -719,15 +573,7 @@ mod tests {
 
     #[test]
     fn test_state_filter_case_insensitive() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let conn = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-            ProtocolState::Tcp(TcpState::Established),
-        );
+        let conn = conn(Protocol::Tcp, "127.0.0.1:12345", "10.0.0.1:80");
 
         let filters = vec![
             "state:established",
@@ -748,28 +594,34 @@ mod tests {
 
     #[test]
     fn test_regex_general_search() {
-        use crate::network::types::*;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let conn = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 12345),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443),
-            ProtocolState::Tcp(TcpState::Established),
-        );
+        let conn_private = conn(Protocol::Tcp, "192.168.1.100:12345", "10.0.0.1:443");
 
         // Regex matching IP pattern
         let filter = ConnectionFilter::parse("/192\\.168\\.[0-9]+/");
-        assert!(filter.matches(&conn));
+        assert!(filter.matches(&conn_private));
 
         // Should not match unrelated connection
-        let conn2 = Connection::new(
-            Protocol::Tcp,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 12345),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-            ProtocolState::Tcp(TcpState::Established),
-        );
+        let conn2 = conn(Protocol::Tcp, "10.0.0.1:12345", "8.8.8.8:53");
         assert!(!filter.matches(&conn2));
+    }
+
+    #[test]
+    fn test_attributed_hostname_matches_hostname_and_general_filters() {
+        use crate::network::types::{AttributedHostname, AttributionSource};
+        use std::time::SystemTime;
+
+        let mut conn = conn(Protocol::Tcp, "192.168.1.100:12345", "142.250.1.1:443");
+        conn.attributed_hostname = Some(AttributedHostname {
+            name: "youtube.com".to_string(),
+            source: AttributionSource::CapturedDns,
+            observed_at: SystemTime::now(),
+        });
+
+        // The attributed name has no SNI/Host backing, but a row shown
+        // as ~youtube.com must still be findable by name.
+        assert!(ConnectionFilter::parse("hostname:youtube.com").matches(&conn));
+        assert!(ConnectionFilter::parse("youtube").matches(&conn));
+        assert!(!ConnectionFilter::parse("hostname:example.org").matches(&conn));
     }
 
     #[test]
@@ -781,5 +633,48 @@ mod tests {
             FilterCriteria::Port(PortMatch::Partial(_)) => {}
             _ => panic!("Expected fallback to Partial for invalid regex"),
         }
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn test_kubernetes_filter_keywords() {
+        use crate::network::types::K8sInfo;
+
+        // Built up front: `conn` below shadows the fixture fn.
+        let bare = conn(Protocol::Tcp, "127.0.0.1:12345", "10.0.0.1:80");
+        let mut conn = conn(Protocol::Tcp, "127.0.0.1:12345", "10.0.0.1:80");
+        conn.k8s_info = Some(K8sInfo {
+            pod_uid: Some("c3b4d893-473e-43c2-8013-8ee2955a4630".to_string()),
+            pod_name: Some("nginx-86644db9cc-mf5lx".to_string()),
+            pod_namespace: Some("demo-traffic".to_string()),
+            container_id: Some(
+                "c16c7605305c854d8582a1db3d5bb3c4b6c89a08e914223e9d500682b3fb0b1b".to_string(),
+            ),
+            container_name: Some("nginx".to_string()),
+            cgroup_path: None,
+        });
+
+        // pod: matches by name (substring)
+        assert!(ConnectionFilter::parse("pod:nginx").matches(&conn));
+        // pod: matches by UID prefix
+        assert!(ConnectionFilter::parse("pod:c3b4d893").matches(&conn));
+        // ns: matches namespace
+        assert!(ConnectionFilter::parse("ns:demo-traffic").matches(&conn));
+        assert!(ConnectionFilter::parse("namespace:demo").matches(&conn));
+        // container: matches by name and by ID prefix
+        assert!(ConnectionFilter::parse("container:nginx").matches(&conn));
+        assert!(ConnectionFilter::parse("container:c16c7605").matches(&conn));
+        // Negative cases
+        assert!(!ConnectionFilter::parse("pod:redis").matches(&conn));
+        assert!(!ConnectionFilter::parse("ns:kube-system").matches(&conn));
+        assert!(!ConnectionFilter::parse("container:redis").matches(&conn));
+
+        // Combined filter
+        assert!(ConnectionFilter::parse("ns:demo-traffic pod:nginx").matches(&conn));
+
+        // Filter on connections without K8s info returns no match for any pod filter.
+        assert!(!ConnectionFilter::parse("pod:nginx").matches(&bare));
+        assert!(!ConnectionFilter::parse("ns:demo").matches(&bare));
+        assert!(!ConnectionFilter::parse("container:nginx").matches(&bare));
     }
 }

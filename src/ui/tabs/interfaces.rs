@@ -1,6 +1,4 @@
-//! Interfaces tab — full table of per-NIC counters (RX/TX rate,
-//! packets, errors, drops, collisions) sorted with the active
-//! capture interface first. Read-only, no input handling.
+//! Detailed per-interface table used by the Host tab.
 
 use anyhow::Result;
 use ratatui::{
@@ -8,31 +6,21 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Cell, Row, Table},
+    widgets::{Cell, Row},
 };
 
 use crate::app::App;
 use crate::ui::{
-    ClickableRegions, Component, ComponentContext, format::format_bytes, panel_block, theme,
+    UiState, alert_style, format::format_bytes, section_header, section_title, theme,
+    widgets::scrollbar::render_scrolled_table,
 };
 
-/// Read-only interfaces tab. Stateless for now; the table is rebuilt
-/// from the App's interface-stats DashMap every render.
-pub(in crate::ui) struct InterfacesTab;
-
-impl Component for InterfacesTab {
-    fn draw(
-        &mut self,
-        f: &mut Frame,
-        area: Rect,
-        ctx: &ComponentContext<'_>,
-        _click_regions: &mut ClickableRegions,
-    ) -> Result<()> {
-        draw_interface_stats(f, ctx.app, area)
-    }
-}
-
-pub(in crate::ui) fn draw_interface_stats(f: &mut Frame, app: &App, area: Rect) -> Result<()> {
+pub(in crate::ui) fn draw_interface_stats(
+    f: &mut Frame,
+    app: &App,
+    ui_state: &UiState,
+    area: Rect,
+) -> Result<()> {
     let mut stats = app.get_interface_stats();
     let rates = app.get_interface_rates();
 
@@ -54,25 +42,12 @@ pub(in crate::ui) fn draw_interface_stats(f: &mut Frame, app: &App, area: Rect) 
         return Ok(());
     }
 
-    // Create table rows
     let mut rows = Vec::new();
 
     for stat in &stats {
-        // Determine error style
-        let error_style = if stat.rx_errors > 0 || stat.tx_errors > 0 {
-            theme::fg(theme::err())
-        } else {
-            theme::fg(theme::ok())
-        };
+        let error_style = alert_style(stat.rx_errors > 0 || stat.tx_errors > 0, theme::err());
+        let drop_style = alert_style(stat.rx_dropped > 0 || stat.tx_dropped > 0, theme::warn());
 
-        // Determine drop style
-        let drop_style = if stat.rx_dropped > 0 || stat.tx_dropped > 0 {
-            theme::fg(theme::warn())
-        } else {
-            theme::fg(theme::ok())
-        };
-
-        // Get rate for this interface
         let rx_rate_str = if let Some(rate) = rates.get(&stat.interface_name) {
             format!("{}/s", format_bytes(rate.rx_bytes_per_sec))
         } else {
@@ -103,23 +78,9 @@ pub(in crate::ui) fn draw_interface_stats(f: &mut Frame, app: &App, area: Rect) 
         ]));
     }
 
-    // Create table
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(14), // Interface
-            Constraint::Length(12), // RX Bytes
-            Constraint::Length(12), // TX Bytes
-            Constraint::Length(10), // RX Packets
-            Constraint::Length(10), // TX Packets
-            Constraint::Length(9),  // RX Err
-            Constraint::Length(9),  // TX Err
-            Constraint::Length(10), // RX Drop
-            Constraint::Length(10), // TX Drop
-            Constraint::Length(10), // Collis
-        ],
-    )
-    .header({
+    let inner = section_header(f, area, section_title(" Interface Statistics"));
+
+    let header = {
         let right = |s: &str| Cell::from(Line::from(s.to_string()).right_aligned());
         Row::new(vec![
             Cell::from("Interface"),
@@ -133,12 +94,28 @@ pub(in crate::ui) fn draw_interface_stats(f: &mut Frame, app: &App, area: Rect) 
             right("TX Drop"),
             right("Collisions"),
         ])
-        .style(theme::fg(theme::heading()))
-    })
-    .block(panel_block(" Interface Statistics "))
-    .style(Style::default());
-
-    f.render_widget(table, area);
+    };
+    // Windowed against the scroll offset so hosts with dozens of
+    // bridge/veth interfaces can reach them all.
+    render_scrolled_table(
+        f,
+        inner,
+        header,
+        rows,
+        &[
+            Constraint::Length(14), // Interface
+            Constraint::Length(12), // RX Bytes
+            Constraint::Length(12), // TX Bytes
+            Constraint::Length(10), // RX Packets
+            Constraint::Length(10), // TX Packets
+            Constraint::Length(9),  // RX Err
+            Constraint::Length(9),  // TX Err
+            Constraint::Length(10), // RX Drop
+            Constraint::Length(10), // TX Drop
+            Constraint::Length(10), // Collis
+        ],
+        &ui_state.interfaces_scroll,
+    );
 
     Ok(())
 }

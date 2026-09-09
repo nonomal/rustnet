@@ -14,6 +14,8 @@
 - [排序](#sorting)
 - [进程分组](#process-grouping)
 - [网络统计面板](#network-statistics-panel)
+- [进程活动](#process-activity)
+- [主机套接字清单](#host-socket-inventory)
 - [接口统计](#interface-statistics)
 - [连接生命周期与视觉指示器](#connection-lifecycle--visual-indicators)
 - [日志](#logging)
@@ -62,6 +64,9 @@ rustnet --refresh-interval 2000
 # 禁用深度包检测
 rustnet --no-dpi
 
+# 选择颜色主题（muted、vivid、catppuccin-mocha、tokyo-night、gruvbox、nord）
+rustnet --theme tokyo-night
+
 # 禁用反向 DNS 查找（默认启用）
 rustnet --no-resolve-dns
 
@@ -82,14 +87,18 @@ Options:
   -i, --interface <INTERFACE>            要监控的网络接口
       --no-localhost                     过滤掉 localhost 连接（默认：已过滤）
       --show-localhost                   显示 localhost 连接（覆盖默认过滤）
-  -r, --refresh-interval <MILLISECONDS>  UI 刷新间隔，单位为毫秒 [默认：1000]
+  -r, --refresh-interval <MILLISECONDS>  UI 刷新间隔，单位为毫秒 [默认：500]
       --no-dpi                           禁用深度包检测
       --no-resolve-dns                   禁用反向 DNS 查找（默认启用）
       --show-ptr-lookups                 显示 PTR 查找连接（默认隐藏）
   -l, --log-level <LEVEL>                设置日志级别（如果未提供，则不启用日志）
       --json-log <FILE>                  将连接事件以 JSON 格式记录到指定文件
       --pcap-export <FILE>               将捕获的数据包导出到 PCAP 文件供 Wireshark 分析
+      --pcapng-export <FILE>             将捕获的数据包导出为带注释的 PCAPNG 文件供 Wireshark 分析
       --no-color                         禁用 UI 中的所有颜色（同时尊重 NO_COLOR 环境变量）
+      --theme <PRESET>                   颜色主题：muted（默认）、vivid、catppuccin-mocha、
+                                         tokyo-night、gruvbox、nord。优先于配置文件
+                                         （~/.config/rustnet/config.toml）中设置的主题
       --geoip-country <PATH>             GeoLite2-Country.mmdb 的路径（未指定时自动发现）
       --geoip-asn <PATH>                 GeoLite2-ASN.mmdb 的路径（未指定时自动发现）
       --geoip-city <PATH>                GeoLite2-City.mmdb 的路径（未指定时自动发现）
@@ -97,9 +106,13 @@ Options:
   -f, --bpf-filter <FILTER>              用于数据包捕获的 BPF 过滤器表达式
       --no-sandbox                       禁用 Landlock 沙箱（仅限 Linux）
       --sandbox-strict                   要求完整沙箱强制执行，否则退出（仅限 Linux）
+      --no-uid-drop                      初始化后保持 root 运行，不降权到
+                                         SUDO_UID/SUDO_GID（或 nobody）（仅限 Linux、macOS 和 FreeBSD）
   -h, --help                             打印帮助
   -V, --version                          打印版本
 ```
+
+使用可选 `kubernetes` feature 编译的版本（包括官方 Docker 镜像）还会提供 `--kubernetes <MODE>`。详见下文的 [`--kubernetes`](#--kubernetes-mode-optional-feature)。
 
 ### 选项详情<a id="option-details"></a>
 
@@ -123,6 +136,11 @@ rustnet -i any
 rustnet -i eth0          # 监控以太网接口
 rustnet -i wlan0         # 监控 WiFi 接口
 rustnet -i en0           # 监控 macOS 主接口
+
+# Windows：可直接使用适配器的友好名称，会自动解析为
+# \Device\NPF_{GUID} 设备
+rustnet -i Ethernet
+rustnet -i "Wi-Fi"
 
 # 监控 VPN 和隧道接口（TUN/TAP 支持）
 rustnet -i utun0         # macOS VPN 隧道（TUN，Layer 3）
@@ -169,9 +187,8 @@ RustNet 自动检测 TUN/TAP 接口并相应调整数据包解析。接口类型
 以毫秒为单位设置 UI 刷新率。较低的值提供更灵敏的更新，但会增加 CPU 使用率。
 
 **建议：**
-- **默认（1000ms）**：大多数用户的良好平衡
-- **高流量网络（2000ms）**：在繁忙网络上降低 CPU 使用率
-- **实时监控（500ms）**：更灵敏的更新，适合快速分析
+- **默认（500ms）**：流畅的实时图表和灵敏的更新
+- **高流量网络（1000-2000ms）**：在繁忙网络上降低 CPU 使用率
 - **低端系统（2000-3000ms）**：降低资源受限机器上的负载
 
 #### `--no-dpi`<a id="--no-dpi"></a>
@@ -193,6 +210,60 @@ RustNet 自动检测 TUN/TAP 接口并相应调整数据包解析。接口类型
 - **`--show-ptr-lookups`**：PTR 查找流量默认隐藏。使用此标志显示解析器生成的 DNS PTR 查询。
 
 **注意**：解析后的主机名也包含在 JSON 日志中（`destination_hostname`、`source_hostname` 字段）。
+
+#### `--theme <PRESET>`<a id="--theme-preset"></a>
+
+选择颜色主题预设：
+
+- **`muted`**（默认）：克制的调色板，只有一个青色强调色。地址保留柔和的颜色
+  （远程 = 蓝色，本地 = 青色）；其他颜色仅用于*信号*：连接状态变化、
+  过期状态（由黄变红的条纹和移除倒计时，且行逐渐柔化为灰色）以及实时带宽。
+- **`vivid`**：与 `muted` 相同的 ANSI-16 调色板，但界面框架本身也带颜色：
+  黄色标题与按键、洋红色边框，并且每列一种颜色。
+- **`catppuccin-mocha`**、**`tokyo-night`**、**`gruvbox`**、**`nord`**：
+  流行配色的真彩色（truecolor）版本。在不支持真彩色的终端上回退到最接近的
+  ANSI-16 颜色。
+
+```bash
+# 让界面框架也带颜色，每列一种颜色
+rustnet --theme vivid
+
+# 使用真彩色主题
+rustnet --theme tokyo-night
+```
+
+主题也可以在可选的配置文件中设置，路径为 `~/.config/rustnet/config.toml`
+（设置了 `$XDG_CONFIG_HOME` 时为 `$XDG_CONFIG_HOME/rustnet/config.toml`；
+Windows 上为 `%APPDATA%\rustnet\config.toml`），这样无需每次运行都加此参数。
+可选的 `[theme.overrides]` 表可替换单个颜色：
+
+```toml
+[theme]
+name = "tokyo-night"
+
+[theme.overrides]
+accent = "#ff9e64"
+border = "darkgray"
+```
+
+覆盖值为 ANSI 颜色名（`red`、`lightblue`、`darkgray` 等）或 `#rrggbb`
+十六进制值。有效的键：`accent`、`ok`、`warn`、`err`、`info`、`special`、
+`muted`、`faint`、`text`、`heading`、`label`、`key`、`border`、`rx`、`tx`、
+`rx_wave`、`tx_wave`、`selection_bg`、`selection_fg`、`status_bg`。
+
+优先级：命令行的 `--theme` 优先于配置文件，配置文件优先于默认的 `muted`。
+配置文件缺失没有影响；文件不可读、无效或覆盖值错误时，启动时打印一条警告并
+回退到默认值。覆盖使某个前景/背景组合的对比度低于 3:1 时，启动时也会打印一条
+警告，但颜色仍按原样使用。通过 `sudo rustnet` 运行时，读取的是执行 sudo 的
+用户的配置而非 root 的，且该文件必须归该用户所有。
+
+在浅色终端背景上，ANSI Gray（`muted` 和 `vivid` 预设的 muted/label 文字层级）
+几乎不可读，因此 rustnet 会在启动时向终端查询背景色（OSC 11 查询，仅限
+Unix），并在背景报告为浅色时将这些灰色层级加深为 ANSI DarkGray，各进程名的
+辨识色也会相应加深。不回应查询的终端保持主题原样，显式的 `[theme.overrides]`
+值也绝不会被改动。
+
+相关：`--no-color` 完全禁用所有颜色（同时尊重 `NO_COLOR` 环境变量）。
 
 #### `-f, --bpf-filter <FILTER>`<a id="-f---bpf-filter-filter"></a>
 
@@ -244,6 +315,38 @@ rustnet --bpf-filter "not port 22"
 
 日志文件创建于 `logs/` 目录，带时间戳：`rustnet_YYYY-MM-DD_HH-MM-SS.log`
 
+#### `--kubernetes <MODE>`（可选 feature）<a id="--kubernetes-mode-optional-feature"></a>
+
+将连接归属到对应的 Kubernetes pod 和 container。此参数仅存在于启用了 `kubernetes` cargo feature 的构建中。官方 Docker 镜像（`ghcr.io/domcyrus/rustnet`）已启用，而原生安装（cargo、Homebrew、deb/rpm）默认未启用。
+
+**模式：**
+
+- `auto`（默认）：仅当 RustNet 本身运行在 pod 内时启用归属识别
+- `on`：始终启用，例如直接在节点上运行时
+- `off`：禁用归属识别
+
+启用后，RustNet 通过 cgroup（`/proc/<pid>/cgroup`）将每条连接的 PID 映射到 pod UID 和 container ID，并从 kubelet 日志目录（`/var/log/containers`、`/var/log/pods`）解析可读的 pod 与 container 名称。此方法与容器运行时无关，不需要 CRI socket 或 kubelet 凭据。即使 RustNet 使用 `hostNetwork: true`，基于 PID 的 socket 表也能识别 pod 所属连接，因为这些表能感知 network namespace。
+
+归属信息会出现在：
+
+- **详情标签页**的 Kubernetes 区域，包括 pod 名、namespace、pod UID、container 名和 container ID
+- **JSON 日志**（`--json-log`）和 `--pcap-export` sidecar JSONL 中，每个连接事件包含一个 `kubernetes` 对象
+- **PCAPNG 数据包注释**（`--pcapng-export`）中，使用 `pod=`、`ns=`、`pod_uid=`、`container=` 和 `container_id=` 字段
+- `pod:`、`ns:` 和 `container:` [过滤关键字](#keyword-filters)
+
+**在集群上运行：** 最简单的方法是使用 [kubectl-rustnet](https://github.com/domcyrus/kubectl-rustnet) 插件（`kubectl krew install rustnet`）。它使用官方镜像在节点上启动临时调试 pod，以只读方式挂载 kubelet 日志目录来解析名称，并在退出时清理 pod。由于插件让 RustNet 在 pod 内运行，默认的 `auto` 模式无需额外参数即可启用归属识别。
+
+```bash
+# 在 Kubernetes 集群上通过插件作为临时调试 pod 运行
+kubectl rustnet --node worker-3
+
+# 构建启用此 feature 的原生版本
+cargo build --release --features kubernetes
+
+# 在 pod 外强制启用归属识别，例如直接在节点上运行
+rustnet --kubernetes on
+```
+
 ## 键盘控制<a id="keyboard-controls"></a>
 
 ### 导航<a id="navigation"></a>
@@ -259,26 +362,29 @@ rustnet --bpf-filter "not port 22"
 
 - `Tab` 或 `]` —— 下一个标签页
 - `Shift+Tab` 或 `[` —— 上一个标签页
-- `1` / `2` / `3` / `4` / `5` —— 直接跳转到 概览 / 详情 / 接口 / 图表 / 帮助
+- `1` / `2` / `3` / `4` / `5`：直接跳转到 概览 / 详情 / 活动 / 图表 / 主机
 - `Enter` —— 查看所选连接的详细信息
 - `Esc` —— 返回上一个视图或清除活动过滤器
-- `h` —— 切换帮助屏幕
+- `h`：切换仅包含当前标签页相关操作的帮助浮层
+
+帮助浮层会保留其下方的当前标签页，并且只列出适用于该标签页的操作和概念。浮层打开时仍可使用标签页导航键（`Tab`、`Shift+Tab`、`1`-`5`），点击鼠标任意位置即可关闭浮层。
 
 ### 操作<a id="actions"></a>
 
 - `c` —— 将远程地址复制到剪贴板
 - `p` —— 在服务名和端口号之间切换
-- `d` —— 在主机名和 IP 地址之间切换（由 `--no-resolve-dns` 禁用）
+- `d`：在概览中切换主机名/IP，或在活动标签页切换出站 (TX)/入站 (RX)
 - `/` —— 进入过滤模式（vim 风格搜索，实时结果）
 - `x` —— 清除所有连接并重置统计（按两次确认）
 - `t` —— 切换历史（已关闭）连接的显示
+- `i`：在概览中切换 System 信息侧边栏，或从活动 / 主机标签页打开主机接口详情
 - `r` —— 将视图重置为默认值（清除分组、排序、过滤和历史）
 
 ### 进程分组<a id="process-grouping-1"></a>
 
 - `a` —— 切换进程分组模式（按进程聚合连接）
 - `Space` —— 展开/折叠所选进程分组
-- `←` 或 `h` —— 折叠所选分组
+- `←`：折叠所选分组
 - `→` 或 `l` —— 展开所选分组
 
 ### 排序<a id="sorting-1"></a>
@@ -308,7 +414,7 @@ RustNet 具有完整的鼠标支持。鼠标捕获自动启用 —— 以下描�
 
 | 操作 | 效果 |
 |------|------|
-| **单击** 分组头部（`[+]`/`[-]`） | 选择该分组 |
+| **单击** 分组头部（`▸`/`▾`） | 选择该分组 |
 | **双击** 分组头部 | 展开或折叠进程分组 |
 | **单击** 展开分组内的连接 | 选择该连接 |
 | **双击** 展开分组内的连接 | 打开该连接的详情标签页 |
@@ -350,11 +456,16 @@ RustNet 具有完整的鼠标支持。鼠标捕获自动启用 —— 以下描�
 | `src:` | `source:` | 源 IP/主机名 | `src:192.168` 匹配 192.168.x.x |
 | `dst:` | `dest:`、`destination:` | 目的地址 | `dst:github.com` 匹配 github.com |
 | `process:` | `proc:` | 进程名 | `process:ssh` 匹配 ssh、sshd |
-| `sni:` | `host:`、`hostname:` | SNI 主机名（HTTPS） | `sni:api` 匹配 api.example.com |
+| `sni:` | `host:`、`hostname:` | SNI 主机名（HTTPS）及 DNS 归因主机名 | `sni:api` 匹配 api.example.com |
 | `service:` | `svc:` | 服务名 | `service:https` 匹配 HTTPS 服务 |
 | `app:` | `application:` | 检测到的应用协议 | `app:ssh` 匹配 SSH 连接 |
 | `state:` | | 协议状态 | `state:established` 匹配已建立的连接 |
 | `proto:` | `protocol:` | 协议类型 | `proto:tcp` 匹配 TCP 连接 |
+| `pod:` | | Kubernetes pod 名或 UID * | `pod:nginx` 匹配 nginx-86644db9cc-mf5lx |
+| `ns:` | `namespace:` | Kubernetes pod namespace * | `ns:kube-system` 匹配 kube-system 中的 pod |
+| `container:` | `cont:` | Kubernetes container 名或 ID * | `container:nginx` 匹配 nginx container |
+
+\* 需要启用 `kubernetes` feature 的构建，并已激活 pod 归属识别。详见 [`--kubernetes`](#--kubernetes-mode-optional-feature)。
 
 ### 状态过滤<a id="state-filtering"></a>
 
@@ -422,7 +533,7 @@ RustNet 提供强大的表格排序功能来帮助你分析网络连接。按 `s
 
 **找出带宽大户（上下行合计流量）：**
 ```
-反复按 's' 直到看到：Down/Up ↓
+反复按 's' 直到看到：Bandwidth Total ↓
 总带宽最高的连接显示在顶部
 ```
 
@@ -438,15 +549,18 @@ RustNet 提供强大的表格排序功能来帮助你分析网络连接。按 `s
 
 | 列 | 默认方向 | 描述 |
 |--------|-------------------|-------------|
-| **Protocol** | ↑ 升序 | 按协议类型排序（TCP、UDP、ICMP 等） |
-| **Local Address** | ↑ 升序 | 按本地 IP:port 排序（适用于多接口系统） |
-| **Remote Address** | ↑ 升序 | 按远程 IP:port 排序 |
-| **Location** | ↑ 升序 | 按国家代码排序（需要 GeoIP 数据库） |
-| **State** | ↑ 升序 | 按连接状态排序（ESTABLISHED 等） |
-| **Service** | ↑ 升序 | 按服务名或端口号排序 |
-| **Application** | ↑ 升序 | 按检测到的应用协议排序（HTTP、DNS 等） |
-| **Bandwidth (Down/Up)** | ↓ 降序 | 按**上下行合计**带宽排序（默认最高优先） |
 | **Process** | ↑ 升序 | 按进程名字母顺序排序 |
+| **Remote Address** | ↑ 升序 | 按远程 IP:port 排序 |
+| **Local Address** | ↑ 升序 | 按本地 IP:port 排序（适用于多接口系统） |
+| **Location** | ↑ 升序 | 按国家代码排序（需要 GeoIP 数据库） |
+| **Service** | ↑ 升序 | 按服务名或端口号排序 |
+| **Application** | ↑ 升序 | 按检测到的应用协议排序（HTTP、DNS 等），以 TCP/UDP 作为同序比较 |
+| **State** | ↑ 升序 | 按连接状态排序（ESTABLISHED 等） |
+| **RTT** | ↓ 降序 | 按往返时延排序（默认最慢的连接优先） |
+| **Health** | ↓ 降序 | 按协议相关健康信号的严重程度排序，再按事件数排序 |
+| **Bandwidth (Rx/Tx)** | ↓ 降序 | 按**上下行合计**带宽排序（默认最高优先） |
+
+在窄终端下被隐藏的列仍留在循环中 —— 当前排序列始终显示在表格的区段标题中。
 
 ### 排序指示器<a id="sort-indicators"></a>
 
@@ -458,12 +572,12 @@ RustNet 提供强大的表格排序功能来帮助你分析网络连接。按 `s
 **视觉指示器：**
 ```
 活动列头部以青色和下划线显示：
-Pro │ Local Address │ Remote Address ↑│ State │ ...
-                      ^^^^^^^^^^^^^^^^
-                      （青色、下划线、带箭头）
+Process │ Remote ↑ │ Local │ Service │ App │ ...
+          ^^^^^^^^
+          （青色、下划线、带箭头）
 
-表格标题显示当前排序：
-┌─ Active Connections (Sort: Remote Addr ↑) ──┐
+区段标题显示当前排序：
+▎ Active Connections · 42 shown · sort Remote Addr ↑
 ```
 
 ### 排序行为<a id="sort-behavior"></a>
@@ -471,7 +585,7 @@ Pro │ Local Address │ Remote Address ↑│ State │ ...
 **按 `s`（小写）—— 循环列：**
 - 移动到从左到右视觉顺序的下一列
 - **重置为该列的默认方向**
-- 带宽列默认降序（↓）以优先显示最高值
+- 带宽、RTT 和 Health 默认降序（↓），优先显示最显著的值
 - 文本列默认升序（↑）以按字母顺序排列
 
 **按 `S`（Shift+s）—— 切换方向：**
@@ -493,7 +607,7 @@ Pro │ Local Address │ Remote Address ↑│ State │ ...
 示例工作流：
 ```
 1. 按 '/' 并输入 'firefox' 过滤 Firefox 连接
-2. 按 's' 直到看到 "Down/Up ↓"
+2. 按 's' 直到看到 "Bandwidth Total ↓"
 3. 现在查看按总带宽（上下行合计）排序的 Firefox 连接
 ```
 
@@ -501,7 +615,7 @@ Pro │ Local Address │ Remote Address ↑│ State │ ...
 
 **找出哪个进程使用最多带宽：**
 ```
-1. 按 's' 直到出现 "Down/Up ↓"
+1. 按 's' 直到出现 "Bandwidth Total ↓"
 2. 顶部连接显示最高总带宽（上下行合计）
 3. 查看 "Process" 列以确定是哪个应用
 ```
@@ -515,8 +629,8 @@ Pro │ Local Address │ Remote Address ↑│ State │ ...
 
 **找出空闲连接（最低带宽）：**
 ```
-1. 按 's' 循环到 "Down/Up ↓"
-2. 按 'S' 切换到 "Down/Up ↑"（升序）
+1. 按 's' 循环到 "Bandwidth Total ↓"
+2. 按 'S' 切换到 "Bandwidth Total ↑"（升序）
 3. 总带宽最低的连接显示在最前面
 ```
 
@@ -540,28 +654,32 @@ RustNet 可以按进程名分组连接，提供聚合视图，让你更容易看
 
 再次按 `a` 返回扁平（未分组）连接列表。
 
+启用此模式时，Overview 状态栏会高亮 `a grouped`。状态栏还会根据所选
+进程组显示 `space expand` 或 `space collapse`，即使当前选择的是该组内
+的单个连接，也会保持这一提示。
+
 ### 分组视图显示<a id="grouped-view-display"></a>
 
 启用分组时，连接列表显示进程分组：
 
 ```
-[+] firefox (12)              TCP: 10 UDP: 2     12.5K↓/1.2K↑
-[-] chrome (8)                TCP: 8  UDP: 0     45.2K↓/5.1K↑
-  ├── TCP  192.168.1.10:54321  142.250.80.78:443    ESTABLISHED  HTTPS
-  ├── TCP  192.168.1.10:54322  142.250.80.78:443    ESTABLISHED  HTTPS
-  └── UDP  192.168.1.10:54323  8.8.8.8:53           -            DNS
-[+] systemd-resolved (3)      TCP: 0  UDP: 3     0.2K↓/0.1K↑
-[+] <unknown> (5)             TCP: 2  UDP: 3     0.5K↓/0.2K↑
+▸ firefox (12)                                       TCP:10 UDP:2  12.5K/1.2K
+▾ chrome (8)                                         TCP:8 UDP:0   45.2K/5.1K
+  ├─ 4101   142.250.80.78:443  192.168.1.10:54321   ESTABLISHED   1.2K/0.3K
+  ├─ 4101   142.250.80.78:443  192.168.1.10:54322   ESTABLISHED   0.8K/0.1K
+  └─ 4102   8.8.8.8:53         192.168.1.10:54323   UDP_ACTIVE    0.2K/0.1K
+▸ systemd-resolved (3)                               TCP:0 UDP:3   0.2K/0.1K
+▸ <unknown> (5)                                      TCP:2 UDP:3   0.5K/0.2K
 ```
 
 **分组头部格式：**
-- `[+]` / `[-]` —— 折叠/展开指示器
+- `▸` / `▾` —— 折叠/展开指示器
 - 进程名和连接数
 - 协议细分（TCP/UDP 计数）
-- 总带宽（下载↓/上传↑）
+- 总带宽（rx/tx，位于 Bandwidth 列）
 
 **展开的连接：**
-- 树形前缀（`├──` / `└──`）显示层级
+- 树形前缀（`├─` / `└─`）加 PID（进程名由上方的分组头部承载）
 - 单个连接详情（协议、地址、状态、应用）
 
 ### 展开和折叠分组<a id="expanding-and-collapsing-groups"></a>
@@ -640,6 +758,21 @@ Active TCP Flows: 18
 
 ### 逐连接统计<a id="per-connection-statistics"></a>
 
+概览表格的 **Health** 列会显示可观测的连接质量，徽标会随协议变化：
+
+- TCP 的 `R3/O1` 表示三次重传和一个乱序包。
+- QUIC 的 `R1/V0` 表示一个明确的 Retry 包，没有版本协商包。
+- 对于出站 DNS、LLMNR、NetBIOS、STUN 或 NTP 事务，`R2/T1` 表示
+  两次使用相同请求 ID 的重试和一个未收到应答而过期的请求。NTP 每次
+  轮询都携带新的发送时间戳，因此 NTP 主要报告超时而非重试。
+
+可评估且无异常的连接显示 `ok`。普通 UDP、不支持的协议，以及未观察到
+出站请求的事务连接显示 `-`。两位数及以上的计数显示为 `+`，详情页保留
+精确计数。详情页的 Transport Health 卡片会在徽标对应的两个计数标签后
+标注字母（`TCP Retransmits (R)`、`Out-of-Order (O)`），便于把紧凑徽标
+对应回精确数字。Health 排序优先按严重程度：TCP 重传和请求超时高于仅告警的
+乱序、重试及版本事件，同级再按事件数降序排列。
+
 查看连接详情时（在连接上按 `Enter`），显示该特定连接的 TCP 分析：
 
 ```
@@ -649,6 +782,19 @@ Fast Retransmits: 0
 ```
 
 这些计数器独立追踪每个连接，允许你识别遇到数据包丢失或网络问题的有问题连接。
+
+**Window Size（窗口大小）**
+同一张卡片还成对显示两端最后通告的接收窗口：`↓` 是本机通告的窗口，
+限制入站数据；`↑` 是对端通告的窗口，限制出站数据。
+
+```
+Window Size  ↓ 137.50 KB · ↑ 1.00 KB
+```
+
+窗口缩放只在 SYN 握手中协商（RFC 7323），因此 RustNet 启动前就已建立的
+连接显示 `unknown (no handshake)`。仅凭 16 位首部字段，实际窗口可能是其
+数值的 1 到 16384 倍，与其给出无法据此判断的大小，不如报告为未知。
+在 RustNet 运行期间建立的连接会显示字节数。
 
 ### 使用场景<a id="use-cases"></a>
 
@@ -671,6 +817,65 @@ Fast Retransmits: 0
 - SYN 和 FIN 标志在序列号追踪中被正确计算（每个消耗 1 个序列号）
 - 仅 TCP 连接显示分析指标；UDP、ICMP 和其他协议没有这些指标
 
+## 进程活动<a id="process-activity"></a>
+
+活动标签页根据活跃连接以及 RustNet 现有的历史连接池（最多保留 5,000 条）计算有界的进程流量总计。短寿命上传进程在套接字关闭后仍然可见，直到对应历史连接被淘汰或连接被清除。按 `3` 打开此标签页。
+
+主进程表可在出站 (TX) 和入站 (RX) 之间切换，并显示：
+
+- 当前和峰值速率，以及该进程在滚动 60 秒窗口内占所选方向已捕获流量的比例
+- 所选方向的保留字节数，其中包含活跃连接和已保留的历史连接
+- 活跃连接数和连接总数
+- 唯一远端目的地数量和流量最大的远端对端
+- 进程归属覆盖率，无法解析的流量归入 `Unknown`
+- 进程在滚动 60 秒内的流量占所选方向接口流量的百分比
+
+表格会根据终端宽度自适应，较窄的终端会隐藏部分列。各列含义如下：
+
+| 列 | 含义 |
+|---|---|
+| **Process** | 进程名和 PID。无法确定进程归属的流量归入 `Unknown`。 |
+| **Pulse** | 该进程在所选方向滚动 60 秒已捕获流量中的相对占比。 |
+| **TX now / RX now** | 该进程在所选方向的当前流量速率。 |
+| **Peak TX / Peak RX** | 该进程保留在活动视图期间观测到的最高当前速率。 |
+| **60s %** | 该进程在所选方向滚动 60 秒内占全部已捕获进程流量的比例。 |
+| **Iface 60s** | 该进程 60 秒流量占对应接口流量的比例。使用多接口捕获时，`~` 前缀表示与主机范围流量进行近似比较。 |
+| **TX 60s / RX 60s** | 滚动 60 秒内归属到该进程的所选方向捕获字节数。 |
+| **Retained** | 该进程所有活跃连接和保留历史连接在所选方向的字节总数。这是有界的保留数据，不是生命周期累计值。 |
+| **Conns** | `active/total`，例如 `41/66` 表示 41 条活跃连接，共保留 66 条连接。总数包括活跃连接以及最近完成的历史连接。 |
+| **Remote** | 保留连接中的唯一远端 socket endpoint 数量。endpoint 由 IP 地址和端口组成，因此同一主机使用两个端口会计为两个远端；到同一 endpoint 的重复连接只计一次。`+` 后缀表示数量超过 256 个目的地的显示上限。 |
+| **Top remote peer** | 所选方向保留流量最大的远端 endpoint。 |
+
+流量脉冲会显示当前捕获速率，但覆盖率使用同一滚动 60 秒窗口内的捕获字节数与接口计数字节数计算。这可以避免比较两个独立采样的瞬时速率所造成的大幅波动。覆盖率会用捕获总量除以接口总量，并将显示结果限制在 100%，因为两个采集器的窗口端点或计数器可见范围略有不同时可能产生小幅超出。两个原始总量仍会保留显示，便于诊断。当 RustNet 仅捕获一个具名接口时，会直接与该接口比较。使用多接口捕获时，RustNet 会与主机范围的接口汇总值比较，并在结果前加 `~`，因为 VPN 和虚拟接口的计数器可能重叠。
+
+按 `d` 在出站 (TX，蓝色) 和入站 (RX，绿色) 之间切换，按 `s` 轮换活动指标的排序方式，按 `S` 反转排序顺序。详细的接口表格位于主机标签页（按 `5`，再按 `i`）。
+
+进行快速安全检查时，可按滚动字节数或保留字节数对出站流量排序，找出异常的高流量进程，并检查其流量最大的远端对端。保留流量会让短寿命上传进程在套接字关闭后仍然可见。
+
+## 主机套接字清单<a id="host-socket-inventory"></a>
+
+按 `5` 打开主机标签页。此视图直接读取操作系统套接字表，不需要先捕获到数据包，因此可显示未产生流量的监听端点。
+
+套接字视图包括：
+
+- TCP LISTEN、ESTABLISHED、建立中、关闭中和 TIME_WAIT 状态计数
+- UDP BOUND 端点总数
+- 从已捕获连接计算的平均 RTT 和最大 RTT
+- TCP LISTEN 套接字和 UDP BOUND 端点表格，包含本地地址、可选对端、服务、PID 和进程名
+
+UDP 没有 LISTEN 状态。UDP 表中的每一行都代表一个本地绑定端点，其中也包括首次发送时由系统隐式绑定的端点。已连接的 UDP 端点还可能包含对端。
+
+清单每 5 秒刷新一次。由于进程可能在扫描期间退出，或者权限可能隐藏进程详情，进程归属属于尽力而为。无法获得所属进程时，套接字行仍会显示。
+
+| 平台 | 套接字来源 |
+|---|---|
+| Linux | `/proc/net/tcp`、`tcp6`、`udp` 和 `udp6`，并通过 `/proc/<pid>/fd` 中的 socket inode 关联进程 |
+| macOS | 数字格式的 `lsof` 套接字清单，即使 PKTAP 提供数据包进程元数据，此视图仍使用该清单 |
+| FreeBSD | 使用 `sockstat -s` 获取原生 TCP 状态及 UDP 套接字行 |
+| Windows | IP Helper 的 `GetExtendedTcpTable` 和 `GetExtendedUdpTable` owner 表 |
+
+按 `i` 切换到 Interfaces，按 `s` 返回 Sockets。左右方向键也可在两个视图之间切换。
+
 ## 接口统计<a id="interface-statistics"></a>
 
 RustNet 在所有支持的平台上（Linux、macOS、FreeBSD、Windows）提供实时网络接口统计。接口统计显示在两个位置：
@@ -683,8 +888,8 @@ RustNet 在所有支持的平台上（Linux、macOS、FreeBSD、Windows）提供
 - 显示：`InterfaceName: X KB/s ↓ / Y KB/s ↑`
 - 显示累计总数：`Errors (Total): N  Drops (Total): M`
 
-**接口标签页（详细视图）：**
-- 按 `i` 切换接口统计视图
+**主机标签页（详细视图）：**
+- 按 `5` 打开主机标签页，再按 `i` 打开接口统计视图
 - 显示所有网络接口的详细表格
 - 显示每个接口的综合指标
 
@@ -708,7 +913,7 @@ RustNet 在所有支持的平台上（Linux、macOS、FreeBSD、Windows）提供
 
 **所有平台：**
 - 所有计数器（字节、数据包、错误、丢弃）自启动/接口上线以来累计
-- 速率（字节/秒）根据每 2 秒采集的快照计算
+- 速率（字节/秒）根据每 500ms 采集的快照计算
 - 包含回环接口用于监控本地流量
 
 **Windows：**
@@ -766,7 +971,7 @@ WiFi: 150 KB/s ↓ / 45 KB/s ↑
 - macOS/Linux：显示有近期流量的接口（`rx_bytes > 0 || tx_bytes > 0 || rx_packets > 0 || tx_packets > 0`）
 - 特殊接口（`any`、`pktap`）：显示有任何活动的所有接口
 
-**接口标签页：**
+**主机标签页的接口详情：**
 - 显示通过平台特定过滤的所有检测到的接口
 - 排序将当前捕获的接口排在最前面（高亮）
 - 其他接口按字母顺序出现
@@ -795,21 +1000,44 @@ WiFi: 150 KB/s ↓ / 45 KB/s ↑
 
 RustNet 使用智能超时管理自动清理不活跃的连接，同时在移除前提供视觉警告。
 
+### 主机名显示
+
+从连接本身提取的主机名（HTTPS 或 QUIC 的 TLS SNI、HTTP `Host:` 头）显示在 **App** 列中。**Remote** 列中的名称按以下优先级选择（用 `d` 键切换主机名显示）：
+
+1. **DNS 归因主机名**：当连接不携带 SNI / Host 头，但在最近 **10 秒**内观测到了指向该 IP 的 DNS 解析时，以暗色的 `~name:port` 形式渲染
+2. **反向 DNS**（系统解析器，除非用 `--no-resolve-dns` 禁用）
+3. **原始 IP 地址**
+
+前缀 `~` 表示该主机名是从 DNS 响应*推断*出来的，而非从连接本身提取。这对握手后的 QUIC 会话（SNI 已加密）以及不携带主机名载荷的纯 TCP/UDP 连接最有用。归因不需要主动查询，因此即使使用 `--no-resolve-dns` 也能工作。详情标签页会单独显示一行 **Attributed Name**（完整的推断主机名），以及一行 **Attributed Via**（来源和观测时间，如 `Captured DNS, 5s ago`），使来源一目了然。归因主机名可以像其他主机名一样搜索：`sni:` / `host:` / `hostname:` 关键字过滤器和自由文本搜索都能匹配它们。
+
+**注意事项**（RustNet 通过嗅探线上的 DNS 学习名称）：
+
+- **DoH / DoT**（加密 DNS）：没有可观测的明文，无法归因。
+- **`/etc/hosts`、NSCD 缓存、`systemd-resolved` D-Bus API**（`org.freedesktop.resolve1`）：不会发出 DNS 数据包，因此无论采用何种捕获方式都无法归因。
+- **本地 stub 解析器**（例如 `127.0.0.53` 上的 `systemd-resolved`）：如果只捕获物理接口，你会看到 stub 的上游查询，但看不到是哪个应用与 stub 通信。同时捕获 `lo` 才能看到应用侧。
+- **VPN/WireGuard 隧道**：在隧道接口（如 `utun0`、`wg0`）而非底层接口上捕获，才能看到明文 DNS。
+
 ### 视觉陈旧度指示器<a id="visual-staleness-indicators"></a>
 
-连接根据距离被清理的接近程度改变颜色：
+空闲连接行以条纹和倒计时预告自己的清理时间，而不是整行重新着色：
 
-| 颜色 | 含义 | 陈旧度 |
-|-------|---------|-----------|
-| **白色**（默认） | 活跃连接 | < 75% 的超时时间 |
-| **黄色** | 陈旧 - 接近超时 | 75-90% 的超时时间 |
-| **红色** | 严重 - 即将被移除 | > 90% 的超时时间 |
+| 外观 | 含义 | 陈旧度 |
+|------|---------|-----------|
+| **全彩** | 活跃连接 | < 50% 的超时时间 |
+| **条纹 + 倒计时** | 空闲，接近超时；行左侧的 `▎` 条纹和 ↓/↑ 列中的剩余时间（例如 `45s left`）由黄经橙变红（最后阶段加粗），同时 Process、Remote、Local、Loc、Service 和 App 列逐渐柔化为灰色 | 50-100% 的超时时间 |
+| **灰色** | 历史，已关闭并归档；State 列显示 `closed`，↓/↑ 列显示 `n/a` | 超时之后（按 `t` 显示） |
+
+State、RTT 和 Health 列永远不会淡化，因此空闲连接行上红色的重传计数
+仍然代表真实问题。条纹和倒计时是仅有的使用黄色和红色的生命周期单元格，
+倒计时的文字说明了颜色的含义，因此这些颜色不会再让整行重新着色。
+淡化止步于柔和层级：历史连接行的暗淡灰色专门保留给已关闭的连接，
+因此无论在深色还是浅色终端上，空闲连接行都会保留彩色的条纹、倒计时和彩色的信号单元格，
+而历史连接行则整行统一为灰色。
 
 **示例**：一条超时为 10 分钟的 HTTP 连接会：
-- 前 7.5 分钟保持**白色**
-- 7.5 到 9 分钟变为**黄色**（警告）
-- 9 分钟后变为**红色**（严重）
-- 10 分钟时被移除
+- 前 5 分钟保持**全彩**
+- 5 到 10 分钟在行左侧显示 `▎` **条纹**并在 ↓/↑ 列显示**倒计时**，两者均由黄变红，同时标识列逐渐柔化
+- 10 分钟时被移除，成为标记为 `closed` 的灰色历史连接行
 
 这让你在连接即将从列表中消失前得到预警。
 
@@ -820,10 +1048,9 @@ RustNet 根据协议和检测到的应用调整连接超时：
 #### TCP 连接<a id="tcp-connections"></a>
 - **HTTP/HTTPS**（通过 DPI 检测）：**10 分钟** —— 支持 HTTP keep-alive
 - **SSH**（通过 DPI 检测）：**30 分钟** —— 适应长交互会话
-- **活跃已建立**（< 1 分钟空闲）：**10 分钟**
-- **空闲已建立**（> 1 分钟空闲）：**5 分钟**
-- **TIME_WAIT**：30 秒 —— 标准 TCP 超时
-- **CLOSED**：5 秒 —— 快速清理
+- **普通已建立连接**：**5 分钟**
+- **TIME_WAIT**：30 秒（标准 TCP 超时）
+- **CLOSED**：15 秒（终止状态归档宽限期）
 - **SYN_SENT、FIN_WAIT 等**：30-60 秒
 
 #### UDP 连接<a id="udp-connections"></a>
@@ -833,17 +1060,13 @@ RustNet 根据协议和检测到的应用调整连接超时：
 
 #### QUIC 连接（检测到的状态）<a id="quic-connections-detected-state"></a>
 - **已连接**：**3 分钟** 默认（或当可用时使用来自传输参数的 idle timeout）
-- **带 CONNECTION_CLOSE 帧**：1-10 秒（基于关闭类型）
-- **Initial/Handshaking**：60 秒 —— 允许连接建立
-- **Draining**：10 秒 —— RFC 9000 draining 周期
+- **带 CONNECTION_CLOSE 帧**：15 秒
+- **Initial/Handshaking**：60 秒（允许连接建立）
+- **Draining/Closed**：15 秒（终止状态归档宽限期）
 
-### 基于活动的调整<a id="activity-based-adjustment"></a>
+对于非终止状态的连接，每个数据包都会重置空闲计时器。终止状态的 TCP 和 QUIC 连接从首次进入终止状态的时间开始计时，因此重复的 FIN、ACK、RST 或关闭数据包不会推迟归档。
 
-显示近期数据包活动的连接获得更长的超时：
-- **最近数据包 < 60 秒前**：使用"活跃"超时（更长）
-- **最近数据包 > 60 秒前**：使用"空闲"超时（更短）
-
-这确保活跃连接保持可见，而空闲连接更快被清理。
+如果在正在关闭的连接上观察到新的 TCP SYN，RustNet 会创建新的活跃连接代次，并将上一个代次归档为不可变的历史记录。对于与最近归档的终止连接匹配、仅属于延迟关闭流程的 TCP 数据包，RustNet 会在 30 秒内忽略这些数据包，避免生成虚假的已建立连接行。
 
 ### 连接为什么消失<a id="why-connections-disappear"></a>
 
@@ -852,11 +1075,14 @@ RustNet 根据协议和检测到的应用调整连接超时：
 2. 连接进入**关闭状态**（TCP CLOSED、QUIC CLOSED）
 3. 检测到**显式关闭帧**（QUIC CONNECTION_CLOSE）
 
-**注意**：速率指示器（带宽显示）基于近期活动显示*衰减*的流量。连接可能显示带宽下降（黄色条），但在超过空闲超时前仍保留在列表中。这是有意设计的 —— 视觉衰减让你在连接被移除前有时间看到它逐渐结束。
+**注意**：速率指示器基于近期活动显示逐渐衰减的流量。连接在接近空闲或终止状态超时时，可能仍显示正在下降的带宽。历史连接行的当前带宽显示为 `n/a`，因为已关闭的连接没有实时速率；最终字节数和数据包总数仍可在详情中查看。
 
 ### 历史连接<a id="historic-connections"></a>
 
 默认情况下，连接在超时或关闭后从列表中消失。按 `t` 切换**历史连接**模式，使已关闭的连接与活跃连接一起保持可见。
+
+显示历史连接时，Overview 状态栏会高亮 `t history`。它可以与进程分组
+指示器同时处于启用状态。
 
 **工作原理：**
 
@@ -864,6 +1090,7 @@ RustNet 根据协议和检测到的应用调整连接超时：
 
 - **活跃连接**以标准颜色指示器正常显示
 - **历史连接**以**暗灰色**显示，以清楚区分于活跃连接
+- **历史连接带宽**显示为 `n/a`；最终字节数和数据包总数仍可查看
 - 启用历史模式时，表格标题变为 **"Active + Historic Connections"**
 
 **详情视图：**
@@ -1094,6 +1321,18 @@ python scripts/pcap_enrich.py capture.pcap -o annotated.pcapng
 ```
 
 注释 PCAPNG 将进程信息嵌入为数据包注释，在 Wireshark 的数据包详情中可见。
+
+#### 原生带注释 PCAPNG 导出<a id="native-annotated-pcapng-export"></a>
+
+`--pcapng-export` 选项会直接写出带 RustNet 数据包注释的 PCAPNG 文件。想立即在 Wireshark 中打开捕获文件时，可以省去 Python 富化步骤：
+
+```bash
+sudo rustnet -i eth0 --pcapng-export capture.pcapng
+```
+
+数据包注释是实时的 best-effort 标注。RustNet 会短暂等待进程和 GeoIP 补全，然后即使归因仍不可用也会写出数据包；因此有些注释可能只有 DPI/SNI、方向或 GeoIP 字段，而没有 `process=`/`pid=`。高负载下，在处理器阶段之前丢弃的数据包或被有界 PCAPNG 导出队列丢弃的数据包不会出现在 PCAPNG 中，所以同时生成的 `--pcap-export` 文件可能包含 PCAPNG 中缺失的数据包。Enhanced Packet Block 可能不是按捕获时间顺序写入，但保留真实捕获时间戳，Wireshark 可以按时间排序/显示。
+
+当清理阶段的元数据完整性比单个带注释文件更重要时，请使用 `--pcap-export` 加 `capture.pcap.connections.jsonl`。
 
 **手动关联：**
 

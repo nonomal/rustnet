@@ -1,8 +1,9 @@
 ---
-source: src/ui.rs
-assertion_line: 5555
+source: src/ui/mod.rs
+assertion_line: 1121
 expression: output
 ---
+                                                                                
                                                                                 
                                                                                 
                                                                                 
@@ -14,4 +15,8 @@ expression: output
 │                                                                              │
 │                       ⣾ Loading network connections...                       │
 │                                                                              │
+│                   Preparing capture and process attribution                  │
+│                                                                              │
+│                   ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣶⣿⣿⣿⣿⣷⣤⡀⠀⠀⠀⠀⠀⢀⣠⣤⣤⣤⣄⡀⠀⠀⠀⠀⠀                   │
+│                   ⣀⣠⣴⣾⣿⣿⣿⣷⣦⣄⣀⣀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣀⣀⣠⣴⣿⣿⣿⣿⣿⣿⣿⣶⣤⣀⣀⠀                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯

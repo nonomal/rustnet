@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -23,23 +23,22 @@ jobs:
           if [[ $GITHUB_REF == refs/tags/* ]]; then
             VERSION=${GITHUB_REF#refs/tags/v}
           else
-            VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+            # Read the binary's [package] version, not [workspace.package] (the
+            # latter is the 0.x library version and comes first in Cargo.toml).
+            VERSION=$(awk -F'"' '/^\[package\]/{p=1} p && /^version = /{print $2; exit}' Cargo.toml)
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
       - name: Setup Linux dependencies
         uses: ./.github/actions/setup-linux-deps
+        with:
+          extra-packages: osc obs-build build-essential
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable # unpinned: maintained branch by Rust team member
         with:
           toolchain: stable
-
-      - name: Install OBS dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y osc obs-build build-essential
 
       - name: Configure OBS credentials
         run: |
